@@ -1,6 +1,6 @@
 // $OpenLDAP$
 /*
- * Copyright 2000, OpenLDAP Foundation, All Rights Reserved.
+ * Copyright 2000-2015 The OpenLDAP Foundation, All Rights Reserved.
  * COPYING RESTRICTIONS APPLY, see COPYRIGHT file
  */
 
@@ -17,6 +17,9 @@ class LDAPModification{
 
 		LDAPModification(const LDAPAttribute& attr, mod_op op);
 		LDAPMod *toLDAPMod() const;
+
+		const LDAPAttribute* getAttribute() const;
+		mod_op getOperation() const;
 
 	private:
 		LDAPAttribute m_attr;

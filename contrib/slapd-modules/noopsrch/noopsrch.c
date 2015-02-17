@@ -2,7 +2,7 @@
 /* $OpenLDAP$ */
 /* This work is part of OpenLDAP Software <http://www.openldap.org/>.
  *
- * Copyright 2010-2011 The OpenLDAP Foundation.
+ * Copyright 2010-2015 The OpenLDAP Foundation.
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -139,9 +139,8 @@ noopsrch_response( Operation *op, SlapReply *rs )
 		ctrlsp[0] = ctrl;
 		ctrlsp[1] = NULL;
 		slap_add_ctrls( op, rs, ctrlsp );
-
-		return SLAP_CB_CONTINUE;
 	}
+	return SLAP_CB_CONTINUE;
 }
 
 static int
@@ -199,7 +198,7 @@ noopsrch_db_init( BackendDB *be, ConfigReply *cr)
 		int rc;
 
 		rc = register_supported_control( LDAP_CONTROL_X_NOOPSRCH,
-			SLAP_CTRL_SEARCH, NULL,
+			SLAP_CTRL_SEARCH | SLAP_CTRL_GLOBAL_SEARCH, NULL,
 			noopsrch_parseCtrl, &noopsrch_cid );
 		if ( rc != LDAP_SUCCESS ) {
 			Debug( LDAP_DEBUG_ANY,
@@ -219,11 +218,11 @@ noopsrch_db_destroy( BackendDB *be, ConfigReply *cr )
 
 #ifdef SLAP_CONFIG_DELETE
 	overlay_unregister_control( be, LDAP_CONTROL_X_NOOPSRCH );
-#endif /* SLAP_CONFIG_DELETE */
-
 	if ( --noopsrch_cnt == 0 ) {
 		unregister_supported_control( LDAP_CONTROL_X_NOOPSRCH );
 	}
+
+#endif /* SLAP_CONFIG_DELETE */
 
 	return 0;
 }

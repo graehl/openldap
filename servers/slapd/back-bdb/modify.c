@@ -2,7 +2,7 @@
 /* $OpenLDAP$ */
 /* This work is part of OpenLDAP Software <http://www.openldap.org/>.
  *
- * Copyright 2000-2011 The OpenLDAP Foundation.
+ * Copyright 2000-2015 The OpenLDAP Foundation.
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -153,7 +153,6 @@ int bdb_modify_internal(
 				mod->sm_desc->ad_cname.bv_val, 0, 0);
 			err = modify_delete_values( e, mod, get_permissiveModify(op),
 				text, textbuf, textlen );
-			assert( err != LDAP_TYPE_OR_VALUE_EXISTS );
 			if( err != LDAP_SUCCESS ) {
 				Debug(LDAP_DEBUG_ARGS, "bdb_modify_internal: %d %s\n",
 					err, *text, 0);
@@ -229,7 +228,9 @@ int bdb_modify_internal(
 
  			mod->sm_op = SLAP_MOD_SOFTDEL;
 
- 			if ( err == LDAP_TYPE_OR_VALUE_EXISTS ) {
+			if ( err == LDAP_SUCCESS ) {
+				got_delete = 1;
+			} else if ( err == LDAP_NO_SUCH_ATTRIBUTE ) {
  				err = LDAP_SUCCESS;
  			}
 
@@ -339,31 +340,25 @@ int bdb_modify_internal(
 			if ( a2 ) {
 				/* need to detect which values were deleted */
 				int i, j;
-				struct berval tmp;
-				j = ap->a_numvals;
-				for ( i=0; i<j; ) {
+				/* let add know there were deletes */
+				if ( a2->a_flags & SLAP_ATTR_IXADD )
+					a2->a_flags |= SLAP_ATTR_IXDEL;
+				vals = op->o_tmpalloc( (ap->a_numvals + 1) *
+					sizeof(struct berval), op->o_tmpmemctx );
+				j = 0;
+				for ( i=0; i < ap->a_numvals; i++ ) {
 					rc = attr_valfind( a2, SLAP_MR_ASSERTED_VALUE_NORMALIZED_MATCH,
 						&ap->a_nvals[i], NULL, op->o_tmpmemctx );
-					/* Move deleted values to end of array */
-					if ( rc == LDAP_NO_SUCH_ATTRIBUTE ) {
-						j--;
-						if ( i != j ) {
-							tmp = ap->a_nvals[j];
-							ap->a_nvals[j] = ap->a_nvals[i];
-							ap->a_nvals[i] = tmp;
-							tmp = ap->a_vals[j];
-							ap->a_vals[j] = ap->a_vals[i];
-							ap->a_vals[i] = tmp;
-						}
-						continue;
-					}
-					i++;
+					/* Save deleted values */
+					if ( rc == LDAP_NO_SUCH_ATTRIBUTE )
+						vals[j++] = ap->a_nvals[i];
 				}
-				vals = &ap->a_nvals[j];
+				BER_BVZERO(vals+j);
 			} else {
 				/* attribute was completely deleted */
 				vals = ap->a_nvals;
 			}
+			rc = 0;
 			if ( !BER_BVISNULL( vals )) {
 				rc = bdb_index_values( op, tid, ap->a_desc,
 					vals, e->e_id, SLAP_INDEX_DELETE_OP );
@@ -373,9 +368,11 @@ int bdb_modify_internal(
 						op->o_log_prefix, ap->a_desc->ad_cname.bv_val, 0 );
 					attrs_free( e->e_attrs );
 					e->e_attrs = save_attrs;
-					return rc;
 				}
 			}
+			if ( vals != ap->a_nvals )
+				op->o_tmpfree( vals, op->o_tmpmemctx );
+			if ( rc ) return rc;
 		}
 	}
 
@@ -383,9 +380,53 @@ int bdb_modify_internal(
 	for ( ap = e->e_attrs; ap != NULL; ap = ap->a_next ) {
 		if (ap->a_flags & SLAP_ATTR_IXADD) {
 			ap->a_flags &= ~SLAP_ATTR_IXADD;
-			rc = bdb_index_values( op, tid, ap->a_desc,
-				ap->a_nvals,
-				e->e_id, SLAP_INDEX_ADD_OP );
+			if ( ap->a_flags & SLAP_ATTR_IXDEL ) {
+				/* if any values were deleted, we must readd index
+				 * for all remaining values.
+				 */
+				ap->a_flags &= ~SLAP_ATTR_IXDEL;
+				rc = bdb_index_values( op, tid, ap->a_desc,
+					ap->a_nvals,
+					e->e_id, SLAP_INDEX_ADD_OP );
+			} else {
+				int found = 0;
+				/* if this was only an add, we only need to index
+				 * the added values.
+				 */
+				for ( ml = modlist; ml != NULL; ml = ml->sml_next ) {
+					struct berval *vals;
+					if ( ml->sml_desc != ap->a_desc || !ml->sml_numvals )
+						continue;
+					found = 1;
+					switch( ml->sml_op ) {
+					case LDAP_MOD_ADD:
+					case LDAP_MOD_REPLACE:
+					case LDAP_MOD_INCREMENT:
+					case SLAP_MOD_SOFTADD:
+					case SLAP_MOD_ADD_IF_NOT_PRESENT:
+						if ( ml->sml_op == LDAP_MOD_INCREMENT )
+							vals = ap->a_nvals;
+						else if ( ml->sml_nvalues )
+							vals = ml->sml_nvalues;
+						else
+							vals = ml->sml_values;
+						rc = bdb_index_values( op, tid, ap->a_desc,
+							vals, e->e_id, SLAP_INDEX_ADD_OP );
+						break;
+					}
+					if ( rc )
+						break;
+				}
+				/* This attr was affected by a modify of a subtype, so
+				 * there was no direct match in the modlist. Just readd
+				 * all of its values.
+				 */
+				if ( !found ) {
+					rc = bdb_index_values( op, tid, ap->a_desc,
+						ap->a_nvals,
+						e->e_id, SLAP_INDEX_ADD_OP );
+				}
+			}
 			if ( rc != LDAP_SUCCESS ) {
 				Debug( LDAP_DEBUG_ANY,
 				       "%s: attribute \"%s\" index add failure\n",
@@ -425,49 +466,12 @@ bdb_modify( Operation *op, SlapReply *rs )
 
 	int rc;
 
-#ifdef LDAP_X_TXN
-	int settle = 0;
-#endif
-
 	Debug( LDAP_DEBUG_ARGS, LDAP_XSTRING(bdb_modify) ": %s\n",
 		op->o_req_dn.bv_val, 0, 0 );
 
 #ifdef LDAP_X_TXN
-	if( op->o_txnSpec ) {
-		/* acquire connection lock */
-		ldap_pvt_thread_mutex_lock( &op->o_conn->c_mutex );
-		if( op->o_conn->c_txn == CONN_TXN_INACTIVE ) {
-			rs->sr_text = "invalid transaction identifier";
-			rs->sr_err = LDAP_X_TXN_ID_INVALID;
-			goto txnReturn;
-		} else if( op->o_conn->c_txn == CONN_TXN_SETTLE ) {
-			settle=1;
-			goto txnReturn;
-		}
-
-		if( op->o_conn->c_txn_backend == NULL ) {
-			op->o_conn->c_txn_backend = op->o_bd;
-
-		} else if( op->o_conn->c_txn_backend != op->o_bd ) {
-			rs->sr_text = "transaction cannot span multiple database contexts";
-			rs->sr_err = LDAP_AFFECTS_MULTIPLE_DSAS;
-			goto txnReturn;
-		}
-
-		/* insert operation into transaction */
-
-		rs->sr_text = "transaction specified";
-		rs->sr_err = LDAP_X_TXN_SPECIFY_OKAY;
-
-txnReturn:
-		/* release connection lock */
-		ldap_pvt_thread_mutex_unlock( &op->o_conn->c_mutex );
-
-		if( !settle ) {
-			send_ldap_result( op, rs );
-			return rs->sr_err;
-		}
-	}
+	if( op->o_txnSpec && txn_preop( op, rs ))
+		return rs->sr_err;
 #endif
 
 	ctrls[num_ctrls] = NULL;
@@ -511,8 +515,12 @@ retry:	/* transaction retry */
 	}
 
 	/* begin transaction */
-	rs->sr_err = TXN_BEGIN( bdb->bi_dbenv, NULL, &ltid, 
-		bdb->bi_db_opflags );
+	{
+		int tflags = bdb->bi_db_opflags;
+		if ( get_lazyCommit( op ))
+			tflags |= DB_TXN_NOSYNC;
+		rs->sr_err = TXN_BEGIN( bdb->bi_dbenv, NULL, &ltid, tflags );
+	}
 	rs->sr_text = NULL;
 	if( rs->sr_err != 0 ) {
 		Debug( LDAP_DEBUG_TRACE,
@@ -522,6 +530,8 @@ retry:	/* transaction retry */
 		rs->sr_text = "internal error";
 		goto return_results;
 	}
+	Debug( LDAP_DEBUG_TRACE, LDAP_XSTRING(bdb_modify) ": txn1 id: %x\n",
+		ltid->id(ltid), 0, 0 );
 
 	opinfo.boi_oe.oe_key = bdb;
 	opinfo.boi_txn = ltid;
@@ -641,6 +651,8 @@ retry:	/* transaction retry */
 		rs->sr_text = "internal error";
 		goto return_results;
 	}
+	Debug( LDAP_DEBUG_TRACE, LDAP_XSTRING(bdb_modify) ": txn2 id: %x\n",
+		lt2->id(lt2), 0, 0 );
 	/* Modify the entry */
 	dummy = *e;
 	rs->sr_err = bdb_modify_internal( op, lt2, op->orm_modlist,

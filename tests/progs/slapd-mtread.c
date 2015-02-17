@@ -1,7 +1,7 @@
 /* $OpenLDAP$ */
 /* This work is part of OpenLDAP Software <http://www.openldap.org/>.
  *
- * Copyright 1999-2011 The OpenLDAP Foundation.
+ * Copyright 1999-2015 The OpenLDAP Foundation.
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -49,13 +49,6 @@
 #define RETRIES	0
 #define DEFAULT_BASE	"ou=people,dc=example,dc=com"
 
-static int
-whoami()
-{
-	int me = ldap_pvt_thread_self();
-	return (me);
-}
-
 static void
 do_conn( char *uri, char *manager, struct berval *passwd,
 	LDAP **ld, int nobind, int maxretries, int conn_num );
@@ -71,6 +64,12 @@ do_random( LDAP *ld,
 	int innerloop, int maxretries, int delay, int force, int chaserefs,
 	int idx );
 
+static void
+do_random2( LDAP *ld,
+	char *sbase, char *filter, char **attrs, int noattrs, int nobind,
+	int innerloop, int maxretries, int delay, int force, int chaserefs,
+	int idx );
+
 static void *
 do_onethread( void *arg );
 
@@ -78,11 +77,12 @@ static void *
 do_onerwthread( void *arg );
 
 #define MAX_THREAD	1024
-int	rt_pass[MAX_THREAD];
-int	rt_fail[MAX_THREAD];
-int	rwt_pass[MAX_THREAD];
-int	rwt_fail[MAX_THREAD];
-ldap_pvt_thread_t	rtid[MAX_THREAD], rwtid[MAX_THREAD];
+/* Use same array for readers and writers, offset writers by MAX_THREAD */
+int	rt_pass[MAX_THREAD*2];
+int	rt_fail[MAX_THREAD*2];
+int	*rwt_pass = rt_pass + MAX_THREAD;
+int	*rwt_fail = rt_fail + MAX_THREAD;
+ldap_pvt_thread_t	rtid[MAX_THREAD*2], *rwtid = rtid + MAX_THREAD;
 
 /*
  * Shared globals (command line args)
@@ -108,31 +108,31 @@ int		noconns = 1;
 LDAP		**lds = NULL;
 
 static void
-thread_error(char *string)
+thread_error(int idx, char *string)
 {
 	char		thrstr[BUFSIZ];
 
-	snprintf(thrstr, BUFSIZ, "error on tid: %d: %s", whoami(), string);
+	snprintf(thrstr, BUFSIZ, "error on tidx: %d: %s", idx, string);
 	tester_error( thrstr );
 }
 
 static void
-thread_output(char *string)
+thread_output(int idx, char *string)
 {
 	char		thrstr[BUFSIZ];
 
-	snprintf(thrstr, BUFSIZ, "tid: %d says: %s", whoami(), string);
+	snprintf(thrstr, BUFSIZ, "tidx: %d says: %s", idx, string);
 	tester_error( thrstr );
 }
 
 static void
-thread_verbose(char *string)
+thread_verbose(int idx, char *string)
 {
 	char		thrstr[BUFSIZ];
 
 	if (!verbose)
 		return;
-	snprintf(thrstr, BUFSIZ, "tid: %d says: %s", whoami(), string);
+	snprintf(thrstr, BUFSIZ, "tidx: %d says: %s", idx, string);
 	tester_error( thrstr );
 }
 
@@ -201,6 +201,7 @@ main( int argc, char **argv )
 
 		case 'h':		/* the servers host */
 			host = strdup( optarg );
+			break;
 
 		case 'i':
 			tester_ignore_str2errlist( optarg );
@@ -343,14 +344,14 @@ main( int argc, char **argv )
 	/* Set up read only threads */
 	for ( i = 0; i < threads; i++ ) {
 		ldap_pvt_thread_create( &rtid[i], 0, do_onethread, &rtid[i]);
-		snprintf(outstr, BUFSIZ, "Created RO thread %d [%d]", i, (int)rtid[i]);
-		thread_verbose(outstr);
+		snprintf(outstr, BUFSIZ, "Created RO thread %d", i);
+		thread_verbose(-1, outstr);
 	}
 	/* Set up read/write threads */
 	for ( i = 0; i < rwthreads; i++ ) {
 		ldap_pvt_thread_create( &rwtid[i], 0, do_onerwthread, &rwtid[i]);
-		snprintf(outstr, BUFSIZ, "Created RW thread %d [%d]", i, (int)rwtid[i]);
-		thread_verbose(outstr);
+		snprintf(outstr, BUFSIZ, "Created RW thread %d", i + MAX_THREAD);
+		thread_verbose(-1, outstr);
 	}
 
 	ptpass =  outerloops * loops;
@@ -380,7 +381,7 @@ main( int argc, char **argv )
 		}
 	}
 	for ( i = 0; i < rwthreads; i++ ) {
-		snprintf(outstr, BUFSIZ, "RW thread %d pass=%d fail=%d", i,
+		snprintf(outstr, BUFSIZ, "RW thread %d pass=%d fail=%d", i + MAX_THREAD,
 			rwt_pass[i], rwt_fail[i]);
 		tester_error(outstr);
 		if (rwt_fail[i] != 0 || rwt_pass[i] != ptpass) {
@@ -402,14 +403,13 @@ do_onethread( void *arg )
 {
 	int		i, j, thisconn;
 	LDAP		**mlds;
-	int		me = whoami();
 	char		thrstr[BUFSIZ];
 	int		rc, refcnt = 0;
-	int		myidx = (ldap_pvt_thread_t *)arg - rtid;
+	int		idx = (ldap_pvt_thread_t *)arg - rtid;
 
 	mlds = (LDAP **) calloc( sizeof(LDAP *), noconns);
 	if (mlds == NULL) {
-		thread_error( "Memory error: thread calloc for noconns" );
+		thread_error( idx, "Memory error: thread calloc for noconns" );
 		exit( EXIT_FAILURE );
 	}
 
@@ -417,34 +417,39 @@ do_onethread( void *arg )
 		for(i = 0; i < noconns; i++) {
 			mlds[i] = ldap_dup(lds[i]);
 			if (mlds[i] == NULL) {
-				thread_error( "ldap_dup error" );
+				thread_error( idx, "ldap_dup error" );
 			}
 		}
 		rc = ldap_get_option(mlds[0], LDAP_OPT_SESSION_REFCNT, &refcnt);
 		snprintf(thrstr, BUFSIZ,
-			"RO Thread: %d conns: %d refcnt: %d (rc = %d)",
-			me, noconns, refcnt, rc);
-		thread_verbose(thrstr);
+			"RO Thread conns: %d refcnt: %d (rc = %d)",
+			noconns, refcnt, rc);
+		thread_verbose(idx, thrstr);
 
-		thisconn = (me + j) % noconns;
+		thisconn = (idx + j) % noconns;
 		if (thisconn < 0 || thisconn >= noconns)
 			thisconn = 0;
 		if (mlds[thisconn] == NULL) {
-			thread_error("(failed to dup)");
+			thread_error( idx, "(failed to dup)");
 			tester_perror( "ldap_dup", "(failed to dup)" );
 			exit( EXIT_FAILURE );
 		}
-		snprintf(thrstr, BUFSIZ, "Thread %d using conn %d", me, thisconn);
-		thread_verbose(thrstr);
+		snprintf(thrstr, BUFSIZ, "Using conn %d", thisconn);
+		thread_verbose(idx, thrstr);
 		if ( filter != NULL ) {
-			do_random( mlds[thisconn], entry, filter, attrs,
-				noattrs, nobind, loops, retries, delay, force,
-				chaserefs, myidx );
+			if (strchr(filter, '['))
+				do_random2( mlds[thisconn], entry, filter, attrs,
+					noattrs, nobind, loops, retries, delay, force,
+					chaserefs, idx );
+			else
+				do_random( mlds[thisconn], entry, filter, attrs,
+					noattrs, nobind, loops, retries, delay, force,
+					chaserefs, idx );
 
 		} else {
 			do_read( mlds[thisconn], entry, attrs,
 				noattrs, nobind, loops, retries, delay, force,
-				chaserefs, myidx );
+				chaserefs, idx );
 		}
 		for(i = 0; i < noconns; i++) {
 			(void) ldap_destroy(mlds[i]);
@@ -460,7 +465,6 @@ do_onerwthread( void *arg )
 {
 	int		i, j, thisconn;
 	LDAP		**mlds, *ld;
-	int		me = whoami();
 	char		thrstr[BUFSIZ];
 	char		dn[256], uids[32], cns[32], *base;
 	LDAPMod		*attrp[5], attrs[4];
@@ -472,16 +476,16 @@ do_onerwthread( void *arg )
 	int		adds = 0;
 	int		dels = 0;
 	int		rc, refcnt = 0;
-	int		myidx = (ldap_pvt_thread_t *)arg - rwtid;
+	int		idx = (ldap_pvt_thread_t *)arg - rtid;
 
 	mlds = (LDAP **) calloc( sizeof(LDAP *), noconns);
 	if (mlds == NULL) {
-		thread_error( "Memory error: thread calloc for noconns" );
+		thread_error( idx, "Memory error: thread calloc for noconns" );
 		exit( EXIT_FAILURE );
 	}
 
-	snprintf(uids, 32, "rwtest%04.4d", me);
-	snprintf(cns, 32, "rwtest%04.4d", me);
+	snprintf(uids, sizeof(uids), "rwtest%04d", idx);
+	snprintf(cns, sizeof(cns), "rwtest%04d", idx);
 	/* add setup */
 	for (i = 0; i < 4; i++) {
 		attrp[i] = &attrs[i];
@@ -504,26 +508,25 @@ do_onerwthread( void *arg )
 		for(i = 0; i < noconns; i++) {
 			mlds[i] = ldap_dup(lds[i]);
 			if (mlds[i] == NULL) {
-				thread_error( "ldap_dup error" );
+				thread_error( idx, "ldap_dup error" );
 			}
 		}
 		rc = ldap_get_option(mlds[0], LDAP_OPT_SESSION_REFCNT, &refcnt);
 		snprintf(thrstr, BUFSIZ,
-			"RW Thread: %d conns: %d refcnt: %d (rc = %d)",
-			me, noconns, refcnt, rc);
-		thread_verbose(thrstr);
+			"RW Thread conns: %d refcnt: %d (rc = %d)",
+			noconns, refcnt, rc);
+		thread_verbose(idx, thrstr);
 
-		thisconn = (me + j) % noconns;
+		thisconn = (idx + j) % noconns;
 		if (thisconn < 0 || thisconn >= noconns)
 			thisconn = 0;
 		if (mlds[thisconn] == NULL) {
-			thread_error("(failed to dup)");
+			thread_error( idx, "(failed to dup)");
 			tester_perror( "ldap_dup", "(failed to dup)" );
 			exit( EXIT_FAILURE );
 		}
-		snprintf(thrstr, BUFSIZ, "START RW Thread %d using conn %d",
-			me, thisconn);
-		thread_verbose(thrstr);
+		snprintf(thrstr, BUFSIZ, "START RW Thread using conn %d", thisconn);
+		thread_verbose(idx, thrstr);
 
 		ld = mlds[thisconn];
 		if (entry != NULL)
@@ -541,21 +544,21 @@ do_onerwthread( void *arg )
 				ret = ldap_delete_ext_s(ld, dn, NULL, NULL);
 				if (ret == LDAP_SUCCESS) {
 					dels++;
-					rwt_pass[myidx]++;
+					rt_pass[idx]++;
 				} else {
-					thread_output(ldap_err2string(ret));
-					rwt_fail[myidx]++;
+					thread_output(idx, ldap_err2string(ret));
+					rt_fail[idx]++;
 				}
 			} else {
-				thread_output(ldap_err2string(ret));
-				rwt_fail[myidx]++;
+				thread_output(idx, ldap_err2string(ret));
+				rt_fail[idx]++;
 			}
 		}
 
 		snprintf(thrstr, BUFSIZ,
-			"INNER STOP RW Thread %d using conn %d (%d/%d)",
-			me, thisconn, adds, dels);
-		thread_verbose(thrstr);
+			"INNER STOP RW Thread using conn %d (%d/%d)",
+			thisconn, adds, dels);
+		thread_verbose(idx, thrstr);
 
 		for(i = 0; i < noconns; i++) {
 			(void) ldap_destroy(mlds[i]);
@@ -592,7 +595,7 @@ retry:;
 
 	if ( do_retry == maxretries ) {
 		snprintf( thrstr, BUFSIZ, "do_conn #%d\n", conn_num );
-		thread_verbose( thrstr );
+		thread_verbose( -1, thrstr );
 	}
 
 	if ( nobind == 0 ) {
@@ -643,7 +646,7 @@ do_random( LDAP *ld,
 	snprintf( thrstr, BUFSIZ,
 			"Read(%d): base=\"%s\", filter=\"%s\".\n",
 			innerloop, sbase, filter );
-	thread_verbose( thrstr );
+	thread_verbose( idx, thrstr );
 
 	rc = ldap_search_ext_s( ld, sbase, LDAP_SCOPE_SUBTREE,
 		filter, attrs, 0, NULL, NULL, NULL, LDAP_NO_LIMIT, &res );
@@ -672,7 +675,7 @@ do_random( LDAP *ld,
 			snprintf( thrstr, BUFSIZ,
 				"Read base=\"%s\" filter=\"%s\" got %d values.\n",
 				sbase, filter, nvalues );
-			thread_verbose( thrstr );
+			thread_verbose( idx, thrstr );
 		}
 
 		for ( i = 0; i < innerloop; i++ ) {
@@ -695,7 +698,83 @@ do_random( LDAP *ld,
 	}
 
 	snprintf( thrstr, BUFSIZ, "Search done (%d).\n", rc );
-	thread_verbose( thrstr );
+	thread_verbose( idx, thrstr );
+}
+
+/* substitute a generated int into the filter */
+static void
+do_random2( LDAP *ld,
+	char *sbase, char *filter, char **srchattrs, int noattrs, int nobind,
+	int innerloop, int maxretries, int delay, int force, int chaserefs,
+	int idx )
+{
+	int  	i = 0, do_retry = maxretries;
+	int     rc = LDAP_SUCCESS;
+	int		lo, hi, range;
+	int	flen;
+	LDAPMessage *res = NULL, *e = NULL;
+	char	*ptr, *ftail;
+	char	thrstr[BUFSIZ];
+	char	fbuf[BUFSIZ];
+
+	snprintf( thrstr, BUFSIZ,
+			"Read(%d): base=\"%s\", filter=\"%s\".\n",
+			innerloop, sbase, filter );
+	thread_verbose( idx, thrstr );
+
+	ptr = strchr(filter, '[');
+	if (!ptr)
+		return;
+	ftail = strchr(filter, ']');
+	if (!ftail || ftail < ptr)
+		return;
+
+	sscanf(ptr, "[%d-%d]", &lo, &hi);
+	range = hi - lo + 1;
+
+	flen = ptr - filter;
+	ftail++;
+
+	for ( i = 0; i < innerloop; i++ ) {
+		int	r = ((double)range)*rand()/(RAND_MAX + 1.0);
+		sprintf(fbuf, "%.*s%d%s", flen, filter, r, ftail);
+
+		rc = ldap_search_ext_s( ld, sbase, LDAP_SCOPE_SUBTREE,
+				fbuf, srchattrs, noattrs, NULL, NULL, NULL,
+				LDAP_NO_LIMIT, &res );
+		if ( res != NULL ) {
+			ldap_msgfree( res );
+		}
+		if ( rc == 0 ) {
+			rt_pass[idx]++;
+		} else {
+			int		first = tester_ignore_err( rc );
+			char		buf[ BUFSIZ ];
+
+			rt_fail[idx]++;
+			snprintf( buf, sizeof( buf ), "ldap_search_ext_s(%s)", entry );
+
+			/* if ignore.. */
+			if ( first ) {
+				/* only log if first occurrence */
+				if ( ( force < 2 && first > 0 ) || abs(first) == 1 ) {
+					tester_ldap_error( ld, buf, NULL );
+				}
+				continue;
+			}
+
+			/* busy needs special handling */
+			tester_ldap_error( ld, buf, NULL );
+			if ( rc == LDAP_BUSY && do_retry > 0 ) {
+				do_retry--;
+				continue;
+			}
+			break;
+		}
+	}
+
+	snprintf( thrstr, BUFSIZ, "Search done (%d).\n", rc );
+	thread_verbose( idx, thrstr );
 }
 
 static void
@@ -711,12 +790,12 @@ retry:;
 	if ( do_retry == maxretries ) {
 		snprintf( thrstr, BUFSIZ, "Read(%d): entry=\"%s\".\n",
 			maxloop, entry );
-		thread_verbose( thrstr );
+		thread_verbose( idx, thrstr );
 	}
 
-	snprintf(thrstr, BUFSIZ, "tid: %d LD %p cnt: %d (retried %d) (%s)", \
-		 whoami(), (void *) ld, maxloop, (do_retry - maxretries), entry);
-	thread_verbose( thrstr );
+	snprintf(thrstr, BUFSIZ, "LD %p cnt: %d (retried %d) (%s)", \
+		 (void *) ld, maxloop, (do_retry - maxretries), entry);
+	thread_verbose( idx, thrstr );
 
 	for ( ; i < maxloop; i++ ) {
 		LDAPMessage *res = NULL;

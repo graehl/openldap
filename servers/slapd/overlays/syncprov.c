@@ -2,7 +2,7 @@
 /* syncprov.c - syncrepl provider */
 /* This work is part of OpenLDAP Software <http://www.openldap.org/>.
  *
- * Copyright 2004-2011 The OpenLDAP Foundation.
+ * Copyright 2004-2015 The OpenLDAP Foundation.
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -28,9 +28,7 @@
 #include "config.h"
 #include "ldap_rq.h"
 
-#ifdef LDAP_DEVEL
 #define	CHECK_CSN	1
-#endif
 
 /* A modify request on a particular entry */
 typedef struct modinst {
@@ -41,25 +39,37 @@ typedef struct modinst {
 typedef struct modtarget {
 	struct modinst *mt_mods;
 	struct modinst *mt_tail;
-	Operation *mt_op;
+	struct berval mt_dn;
 	ldap_pvt_thread_mutex_t mt_mutex;
 } modtarget;
 
+/* All the info of a psearch result that's shared between
+ * multiple queues
+ */
+typedef struct resinfo {
+	struct syncres *ri_list;
+	Entry *ri_e;
+	struct berval ri_dn;
+	struct berval ri_ndn;
+	struct berval ri_uuid;
+	struct berval ri_csn;
+	struct berval ri_cookie;
+	char ri_isref;
+	ldap_pvt_thread_mutex_t ri_mutex;
+} resinfo;
+
 /* A queued result of a persistent search */
 typedef struct syncres {
-	struct syncres *s_next;
-	Entry *s_e;
-	struct berval s_dn;
-	struct berval s_ndn;
-	struct berval s_uuid;
-	struct berval s_csn;
+	struct syncres *s_next;	/* list of results on this psearch queue */
+	struct syncres *s_rilist;	/* list of psearches using this result */
+	resinfo *s_info;
 	char s_mode;
-	char s_isreference;
 } syncres;
 
 /* Record of a persistent search */
 typedef struct syncops {
 	struct syncops *s_next;
+	struct syncprov_info_t *s_si;
 	struct berval	s_base;		/* ndn of search base */
 	ID		s_eid;		/* entryID of search base */
 	Operation	*s_op;		/* search op */
@@ -113,7 +123,9 @@ typedef struct slog_entry {
 } slog_entry;
 
 typedef struct sessionlog {
-	struct berval	sl_mincsn;
+	BerVarray	sl_mincsn;
+	int		*sl_sids;
+	int		sl_numcsns;
 	int		sl_num;
 	int		sl_size;
 	slog_entry *sl_head;
@@ -124,8 +136,8 @@ typedef struct sessionlog {
 /* The main state for this overlay */
 typedef struct syncprov_info_t {
 	syncops		*si_ops;
-	BerVarray	si_ctxcsn;	/* ldapsync context */
 	struct berval	si_contextdn;
+	BerVarray	si_ctxcsn;	/* ldapsync context */
 	int		*si_sids;
 	int		si_numcsns;
 	int		si_chkops;	/* checkpointing info */
@@ -157,12 +169,8 @@ typedef struct opcookie {
 	short osid;	/* sid of op csn */
 	short rsid;	/* sid of relay */
 	short sreference;	/* Is the entry a reference? */
+	syncres ssres;
 } opcookie;
-
-typedef struct mutexint {
-	ldap_pvt_thread_mutex_t mi_mutex;
-	int mi_int;
-} mutexint;
 
 typedef struct fbase_cookie {
 	struct berval *fdn;	/* DN of a modified entry, for scope testing */
@@ -191,13 +199,12 @@ syncprov_state_ctrl(
 
 	BerElementBuffer berbuf;
 	BerElement *ber = (BerElement *)&berbuf;
-
+	LDAPControl *cp;
+	struct berval bv;
 	struct berval	entryuuid_bv = BER_BVNULL;
 
 	ber_init2( ber, 0, LBER_USE_DER );
 	ber_set_option( ber, LBER_OPT_BER_MEMCTX, &op->o_tmpmemctx );
-
-	ctrls[num_ctrls] = op->o_tmpalloc( sizeof ( LDAPControl ), op->o_tmpmemctx );
 
 	for ( a = e->e_attrs; a != NULL; a = a->a_next ) {
 		AttributeDescription *desc = a->a_desc;
@@ -217,18 +224,24 @@ syncprov_state_ctrl(
 			entry_sync_state, &entryuuid_bv );
 	}
 
-	ctrls[num_ctrls]->ldctl_oid = LDAP_CONTROL_SYNC_STATE;
-	ctrls[num_ctrls]->ldctl_iscritical = (op->o_sync == SLAP_CONTROL_CRITICAL);
-	ret = ber_flatten2( ber, &ctrls[num_ctrls]->ldctl_value, 1 );
-
+	ret = ber_flatten2( ber, &bv, 0 );
+	if ( ret == 0 ) {
+		cp = op->o_tmpalloc( sizeof( LDAPControl ) + bv.bv_len, op->o_tmpmemctx );
+		cp->ldctl_oid = LDAP_CONTROL_SYNC_STATE;
+		cp->ldctl_iscritical = (op->o_sync == SLAP_CONTROL_CRITICAL);
+		cp->ldctl_value.bv_val = (char *)&cp[1];
+		cp->ldctl_value.bv_len = bv.bv_len;
+		AC_MEMCPY( cp->ldctl_value.bv_val, bv.bv_val, bv.bv_len );
+		ctrls[num_ctrls] = cp;
+	}
 	ber_free_buf( ber );
 
 	if ( ret < 0 ) {
 		Debug( LDAP_DEBUG_TRACE,
-			"slap_build_sync_ctrl: ber_flatten2 failed\n",
-			0, 0, 0 );
+			"slap_build_sync_ctrl: ber_flatten2 failed (%d)\n",
+			ret, 0, 0 );
 		send_ldap_error( op, rs, LDAP_OTHER, "internal error" );
-		return ret;
+		return LDAP_OTHER;
 	}
 
 	return LDAP_SUCCESS;
@@ -248,11 +261,11 @@ syncprov_done_ctrl(
 	int ret;
 	BerElementBuffer berbuf;
 	BerElement *ber = (BerElement *)&berbuf;
+	LDAPControl *cp;
+	struct berval bv;
 
 	ber_init2( ber, NULL, LBER_USE_DER );
 	ber_set_option( ber, LBER_OPT_BER_MEMCTX, &op->o_tmpmemctx );
-
-	ctrls[num_ctrls] = op->o_tmpalloc( sizeof ( LDAPControl ), op->o_tmpmemctx );
 
 	ber_printf( ber, "{" );
 	if ( send_cookie && cookie ) {
@@ -263,18 +276,25 @@ syncprov_done_ctrl(
 	}
 	ber_printf( ber, "N}" );
 
-	ctrls[num_ctrls]->ldctl_oid = LDAP_CONTROL_SYNC_DONE;
-	ctrls[num_ctrls]->ldctl_iscritical = (op->o_sync == SLAP_CONTROL_CRITICAL);
-	ret = ber_flatten2( ber, &ctrls[num_ctrls]->ldctl_value, 1 );
+	ret = ber_flatten2( ber, &bv, 0 );
+	if ( ret == 0 ) {
+		cp = op->o_tmpalloc( sizeof( LDAPControl ) + bv.bv_len, op->o_tmpmemctx );
+		cp->ldctl_oid = LDAP_CONTROL_SYNC_DONE;
+		cp->ldctl_iscritical = (op->o_sync == SLAP_CONTROL_CRITICAL);
+		cp->ldctl_value.bv_val = (char *)&cp[1];
+		cp->ldctl_value.bv_len = bv.bv_len;
+		AC_MEMCPY( cp->ldctl_value.bv_val, bv.bv_val, bv.bv_len );
+		ctrls[num_ctrls] = cp;
+	}
 
 	ber_free_buf( ber );
 
 	if ( ret < 0 ) {
 		Debug( LDAP_DEBUG_TRACE,
-			"syncprov_done_ctrl: ber_flatten2 failed\n",
-			0, 0, 0 );
+			"syncprov_done_ctrl: ber_flatten2 failed (%d)\n",
+			ret, 0, 0 );
 		send_ldap_error( op, rs, LDAP_OTHER, "internal error" );
-		return ret;
+		return LDAP_OTHER;
 	}
 
 	return LDAP_SUCCESS;
@@ -338,10 +358,10 @@ syncprov_sendinfo(
 
 	if ( ret < 0 ) {
 		Debug( LDAP_DEBUG_TRACE,
-			"syncprov_sendinfo: ber_flatten2 failed\n",
-			0, 0, 0 );
+			"syncprov_sendinfo: ber_flatten2 failed (%d)\n",
+			ret, 0, 0 );
 		send_ldap_error( op, rs, LDAP_OTHER, "internal error" );
-		return ret;
+		return LDAP_OTHER;
 	}
 
 	rs->sr_rspoid = LDAP_SYNC_INFO;
@@ -361,10 +381,10 @@ sp_avl_cmp( const void *c1, const void *c2 )
 	int rc;
 
 	m1 = c1; m2 = c2;
-	rc = m1->mt_op->o_req_ndn.bv_len - m2->mt_op->o_req_ndn.bv_len;
+	rc = m1->mt_dn.bv_len - m2->mt_dn.bv_len;
 
 	if ( rc ) return rc;
-	return ber_bvcmp( &m1->mt_op->o_req_ndn, &m2->mt_op->o_req_ndn );
+	return ber_bvcmp( &m1->mt_dn, &m2->mt_dn );
 }
 
 /* syncprov_findbase:
@@ -430,6 +450,7 @@ syncprov_findbase( Operation *op, fbase_cookie *fc )
 		fop.o_hdr = op->o_hdr;
 		fop.o_time = op->o_time;
 		fop.o_tincr = op->o_tincr;
+		fop.o_extra = op->o_extra;
 
 		cb.sc_response = findbase_cb;
 		cb.sc_private = fc;
@@ -586,7 +607,7 @@ findpres_cb( Operation *op, SlapReply *rs )
 }
 
 static int
-syncprov_findcsn( Operation *op, find_csn_t mode )
+syncprov_findcsn( Operation *op, find_csn_t mode, struct berval *csn )
 {
 	slap_overinst		*on = (slap_overinst *)op->o_bd->bd_info;
 	syncprov_info_t		*si = on->on_bi.bi_private;
@@ -659,15 +680,12 @@ again:
 		break;
 	case FIND_CSN:
 		if ( BER_BVISEMPTY( &cf.f_av_value )) {
-			cf.f_av_value = srs->sr_state.ctxcsn[0];
-			/* If there are multiple CSNs, use the smallest */
-			for ( i=1; i<srs->sr_state.numcsns; i++ ) {
-				if ( ber_bvcmp( &cf.f_av_value, &srs->sr_state.ctxcsn[i] )
-					> 0 ) {
-					cf.f_av_value = srs->sr_state.ctxcsn[i];
-				}
-			}
+			cf.f_av_value = *csn;
 		}
+		fop.o_dn = op->o_bd->be_rootdn;
+		fop.o_ndn = op->o_bd->be_rootndn;
+		fop.o_req_dn = op->o_bd->be_suffix[0];
+		fop.o_req_ndn = op->o_bd->be_nsuffix[0];
 		/* Look for exact match the first time */
 		if ( findcsn_retry ) {
 			cf.f_choice = LDAP_FILTER_EQUALITY;
@@ -750,38 +768,32 @@ again:
 	return rc;
 }
 
-/* Should find a place to cache these */
-static mutexint *get_mutexint()
+static void free_resinfo( syncres *sr )
 {
-	mutexint *mi = ch_malloc( sizeof( mutexint ));
-	ldap_pvt_thread_mutex_init( &mi->mi_mutex );
-	mi->mi_int = 1;
-	return mi;
-}
-
-static void inc_mutexint( mutexint *mi )
-{
-	ldap_pvt_thread_mutex_lock( &mi->mi_mutex );
-	mi->mi_int++;
-	ldap_pvt_thread_mutex_unlock( &mi->mi_mutex );
-}
-
-/* return resulting counter */
-static int dec_mutexint( mutexint *mi )
-{
-	int i;
-	ldap_pvt_thread_mutex_lock( &mi->mi_mutex );
-	i = --mi->mi_int;
-	ldap_pvt_thread_mutex_unlock( &mi->mi_mutex );
-	if ( !i ) {
-		ldap_pvt_thread_mutex_destroy( &mi->mi_mutex );
-		ch_free( mi );
+	syncres **st;
+	int freeit = 0;
+	ldap_pvt_thread_mutex_lock( &sr->s_info->ri_mutex );
+	for (st = &sr->s_info->ri_list; *st; st = &(*st)->s_rilist) {
+		if (*st == sr) {
+			*st = sr->s_rilist;
+			break;
+		}
 	}
-	return i;
+	if ( !sr->s_info->ri_list )
+		freeit = 1;
+	ldap_pvt_thread_mutex_unlock( &sr->s_info->ri_mutex );
+	if ( freeit ) {
+		ldap_pvt_thread_mutex_destroy( &sr->s_info->ri_mutex );
+		if ( sr->s_info->ri_e )
+			entry_free( sr->s_info->ri_e );
+		if ( !BER_BVISNULL( &sr->s_info->ri_cookie ))
+			ch_free( sr->s_info->ri_cookie.bv_val );
+		ch_free( sr->s_info );
+	}
 }
 
-static void
-syncprov_free_syncop( syncops *so )
+static int
+syncprov_free_syncop( syncops *so, int unlink )
 {
 	syncres *sr, *srnext;
 	GroupAssertion *ga, *gnext;
@@ -790,9 +802,20 @@ syncprov_free_syncop( syncops *so )
 	/* already being freed, or still in use */
 	if ( !so->s_inuse || --so->s_inuse > 0 ) {
 		ldap_pvt_thread_mutex_unlock( &so->s_mutex );
-		return;
+		return 0;
 	}
 	ldap_pvt_thread_mutex_unlock( &so->s_mutex );
+	if ( unlink ) {
+		syncops **sop;
+		ldap_pvt_thread_mutex_lock( &so->s_si->si_ops_mutex );
+		for ( sop = &so->s_si->si_ops; *sop; sop = &(*sop)->s_next ) {
+			if ( *sop == so ) {
+				*sop = so->s_next;
+				break;
+			}
+		}
+		ldap_pvt_thread_mutex_unlock( &so->s_si->si_ops_mutex );
+	}
 	if ( so->s_flags & PS_IS_DETACHED ) {
 		filter_free( so->s_op->ors_filter );
 		for ( ga = so->s_op->o_groups; ga; ga=gnext ) {
@@ -804,67 +827,59 @@ syncprov_free_syncop( syncops *so )
 	ch_free( so->s_base.bv_val );
 	for ( sr=so->s_res; sr; sr=srnext ) {
 		srnext = sr->s_next;
-		if ( sr->s_e ) {
-			if ( !dec_mutexint( sr->s_e->e_private )) {
-				sr->s_e->e_private = NULL;
-				entry_free( sr->s_e );
-			}
-		}
+		free_resinfo( sr );
 		ch_free( sr );
 	}
 	ldap_pvt_thread_mutex_destroy( &so->s_mutex );
 	ch_free( so );
+	return 1;
 }
 
 /* Send a persistent search response */
 static int
-syncprov_sendresp( Operation *op, opcookie *opc, syncops *so, int mode )
+syncprov_sendresp( Operation *op, resinfo *ri, syncops *so, int mode )
 {
 	SlapReply rs = { REP_SEARCH };
-	LDAPControl *ctrls[2];
-	struct berval cookie = BER_BVNULL, csns[2];
+	struct berval cookie, csns[2];
 	Entry e_uuid = {0};
 	Attribute a_uuid = {0};
 
 	if ( so->s_op->o_abandon )
 		return SLAPD_ABANDON;
 
-	ctrls[1] = NULL;
-	if ( !BER_BVISNULL( &opc->sctxcsn )) {
-		csns[0] = opc->sctxcsn;
-		BER_BVZERO( &csns[1] );
-		slap_compose_sync_cookie( op, &cookie, csns, so->s_rid, slap_serverID ? slap_serverID : -1 );
-	}
+	rs.sr_ctrls = op->o_tmpalloc( sizeof(LDAPControl *)*2, op->o_tmpmemctx );
+	rs.sr_ctrls[1] = NULL;
+	rs.sr_flags = REP_CTRLS_MUSTBEFREED;
+	csns[0] = ri->ri_csn;
+	BER_BVZERO( &csns[1] );
+	slap_compose_sync_cookie( op, &cookie, csns, so->s_rid, slap_serverID ? slap_serverID : -1 );
 
 #ifdef LDAP_DEBUG
 	if ( so->s_sid > 0 ) {
 		Debug( LDAP_DEBUG_SYNC, "syncprov_sendresp: to=%03x, cookie=%s\n",
-			so->s_sid, cookie.bv_val ? cookie.bv_val : "", 0 );
+			so->s_sid, cookie.bv_val, 0 );
 	} else {
 		Debug( LDAP_DEBUG_SYNC, "syncprov_sendresp: cookie=%s\n",
-			cookie.bv_val ? cookie.bv_val : "", 0, 0 );
+			cookie.bv_val, 0, 0 );
 	}
 #endif
 
 	e_uuid.e_attrs = &a_uuid;
 	a_uuid.a_desc = slap_schema.si_ad_entryUUID;
-	a_uuid.a_nvals = &opc->suuid;
+	a_uuid.a_nvals = &ri->ri_uuid;
 	rs.sr_err = syncprov_state_ctrl( op, &rs, &e_uuid,
-		mode, ctrls, 0, 1, &cookie );
-	if ( !BER_BVISNULL( &cookie )) {
-		op->o_tmpfree( cookie.bv_val, op->o_tmpmemctx );
-	}
+		mode, rs.sr_ctrls, 0, 1, &cookie );
+	op->o_tmpfree( cookie.bv_val, op->o_tmpmemctx );
 
-	rs.sr_ctrls = ctrls;
 	rs.sr_entry = &e_uuid;
 	if ( mode == LDAP_SYNC_ADD || mode == LDAP_SYNC_MODIFY ) {
-		e_uuid = *opc->se;
+		e_uuid = *ri->ri_e;
 		e_uuid.e_private = NULL;
 	}
 
 	switch( mode ) {
 	case LDAP_SYNC_ADD:
-		if ( opc->sreference && so->s_op->o_managedsait <= SLAP_CONTROL_IGNORED ) {
+		if ( ri->ri_isref && so->s_op->o_managedsait <= SLAP_CONTROL_IGNORED ) {
 			rs.sr_ref = get_entry_referrals( op, rs.sr_entry );
 			rs.sr_err = send_search_reference( op, &rs );
 			ber_bvarray_free( rs.sr_ref );
@@ -877,9 +892,9 @@ syncprov_sendresp( Operation *op, opcookie *opc, syncops *so, int mode )
 		break;
 	case LDAP_SYNC_DELETE:
 		e_uuid.e_attrs = NULL;
-		e_uuid.e_name = opc->sdn;
-		e_uuid.e_nname = opc->sndn;
-		if ( opc->sreference && so->s_op->o_managedsait <= SLAP_CONTROL_IGNORED ) {
+		e_uuid.e_name = ri->ri_dn;
+		e_uuid.e_nname = ri->ri_ndn;
+		if ( ri->ri_isref && so->s_op->o_managedsait <= SLAP_CONTROL_IGNORED ) {
 			struct berval bv = BER_BVNULL;
 			rs.sr_ref = &bv;
 			rs.sr_err = send_search_reference( op, &rs );
@@ -890,19 +905,6 @@ syncprov_sendresp( Operation *op, opcookie *opc, syncops *so, int mode )
 	default:
 		assert(0);
 	}
-	/* In case someone else freed it already? */
-	if ( rs.sr_ctrls ) {
-		int i;
-		for ( i=0; rs.sr_ctrls[i]; i++ ) {
-			if ( rs.sr_ctrls[i] == ctrls[0] ) {
-				op->o_tmpfree( ctrls[0]->ldctl_value.bv_val, op->o_tmpmemctx );
-				ctrls[0]->ldctl_value.bv_val = NULL;
-				break;
-			}
-		}
-		rs.sr_ctrls = NULL;
-	}
-
 	return rs.sr_err;
 }
 
@@ -915,52 +917,42 @@ syncprov_qplay( Operation *op, syncops *so )
 {
 	slap_overinst *on = LDAP_SLIST_FIRST(&so->s_op->o_extra)->oe_key;
 	syncres *sr;
-	opcookie opc;
 	int rc = 0;
-
-	opc.son = on;
 
 	do {
 		ldap_pvt_thread_mutex_lock( &so->s_mutex );
 		sr = so->s_res;
-		if ( sr )
-			so->s_res = sr->s_next;
+		/* Exit loop with mutex held */
+		if ( !sr )
+			break;
+		so->s_res = sr->s_next;
 		if ( !so->s_res )
 			so->s_restail = NULL;
-		/* Exit loop with mutex held */
-		if ( !sr || so->s_op->o_abandon )
-			break;
 		ldap_pvt_thread_mutex_unlock( &so->s_mutex );
 
-		if ( sr->s_mode == LDAP_SYNC_NEW_COOKIE ) {
-			SlapReply rs = { REP_INTERMEDIATE };
+		if ( !so->s_op->o_abandon ) {
 
-			rc = syncprov_sendinfo( op, &rs, LDAP_TAG_SYNC_NEW_COOKIE,
-				&sr->s_csn, 0, NULL, 0 );
-		} else {
-			opc.sdn = sr->s_dn;
-			opc.sndn = sr->s_ndn;
-			opc.suuid = sr->s_uuid;
-			opc.sctxcsn = sr->s_csn;
-			opc.sreference = sr->s_isreference;
-			opc.se = sr->s_e;
+			if ( sr->s_mode == LDAP_SYNC_NEW_COOKIE ) {
+				SlapReply rs = { REP_INTERMEDIATE };
 
-			rc = syncprov_sendresp( op, &opc, so, sr->s_mode );
-
-		}
-		if ( sr->s_e ) {
-			if ( !dec_mutexint( sr->s_e->e_private )) {
-				sr->s_e->e_private = NULL;
-				entry_free ( sr->s_e );
+				rc = syncprov_sendinfo( op, &rs, LDAP_TAG_SYNC_NEW_COOKIE,
+					&sr->s_info->ri_cookie, 0, NULL, 0 );
+			} else {
+				rc = syncprov_sendresp( op, sr->s_info, so, sr->s_mode );
 			}
 		}
 
+		free_resinfo( sr );
 		ch_free( sr );
+
+		if ( so->s_op->o_abandon )
+			continue;
 
 		/* Exit loop with mutex held */
 		ldap_pvt_thread_mutex_lock( &so->s_mutex );
+		break;
 
-	} while (0);
+	} while (1);
 
 	/* We now only send one change at a time, to prevent one
 	 * psearch from hogging all the CPU. Resubmit this task if
@@ -992,6 +984,7 @@ syncprov_qtask( void *ctx, void *arg )
 	op->o_hdr = &opbuf.ob_hdr;
 	op->o_controls = opbuf.ob_controls;
 	memset( op->o_controls, 0, sizeof(opbuf.ob_controls) );
+	op->o_sync = SLAP_CONTROL_IGNORED;
 
 	*op->o_hdr = *so->s_op->o_hdr;
 
@@ -1009,7 +1002,7 @@ syncprov_qtask( void *ctx, void *arg )
 	rc = syncprov_qplay( op, so );
 
 	/* decrement use count... */
-	syncprov_free_syncop( so );
+	syncprov_free_syncop( so, 1 );
 
 	return NULL;
 }
@@ -1029,48 +1022,79 @@ static int
 syncprov_qresp( opcookie *opc, syncops *so, int mode )
 {
 	syncres *sr;
+	resinfo *ri;
 	int srsize;
-	struct berval cookie = opc->sctxcsn;
+	struct berval csn = opc->sctxcsn;
 
-	if ( mode == LDAP_SYNC_NEW_COOKIE ) {
+	sr = ch_malloc( sizeof( syncres ));
+	sr->s_next = NULL;
+	sr->s_mode = mode;
+	if ( !opc->ssres.s_info ) {
+
+		srsize = sizeof( resinfo );
+		if ( csn.bv_len )
+			srsize += csn.bv_len + 1;
+
+		if ( opc->se ) {
+			Attribute *a;
+			ri = ch_malloc( srsize );
+			ri->ri_dn = opc->se->e_name;
+			ri->ri_ndn = opc->se->e_nname;
+			a = attr_find( opc->se->e_attrs, slap_schema.si_ad_entryUUID );
+			if ( a )
+				ri->ri_uuid = a->a_nvals[0];
+			else
+				ri->ri_uuid.bv_len = 0;
+			if ( csn.bv_len ) {
+				ri->ri_csn.bv_val = (char *)(ri + 1);
+				ri->ri_csn.bv_len = csn.bv_len;
+				memcpy( ri->ri_csn.bv_val, csn.bv_val, csn.bv_len );
+				ri->ri_csn.bv_val[csn.bv_len] = '\0';
+			} else {
+				ri->ri_csn.bv_val = NULL;
+			}
+		} else {
+			srsize += opc->suuid.bv_len +
+				opc->sdn.bv_len + 1 + opc->sndn.bv_len + 1;
+			ri = ch_malloc( srsize );
+			ri->ri_dn.bv_val = (char *)(ri + 1);
+			ri->ri_dn.bv_len = opc->sdn.bv_len;
+			ri->ri_ndn.bv_val = lutil_strcopy( ri->ri_dn.bv_val,
+				opc->sdn.bv_val ) + 1;
+			ri->ri_ndn.bv_len = opc->sndn.bv_len;
+			ri->ri_uuid.bv_val = lutil_strcopy( ri->ri_ndn.bv_val,
+				opc->sndn.bv_val ) + 1;
+			ri->ri_uuid.bv_len = opc->suuid.bv_len;
+			AC_MEMCPY( ri->ri_uuid.bv_val, opc->suuid.bv_val, opc->suuid.bv_len );
+			if ( csn.bv_len ) {
+				ri->ri_csn.bv_val = ri->ri_uuid.bv_val + ri->ri_uuid.bv_len;
+				memcpy( ri->ri_csn.bv_val, csn.bv_val, csn.bv_len );
+				ri->ri_csn.bv_val[csn.bv_len] = '\0';
+			} else {
+				ri->ri_csn.bv_val = NULL;
+			}
+		}
+		ri->ri_list = &opc->ssres;
+		ri->ri_e = opc->se;
+		ri->ri_csn.bv_len = csn.bv_len;
+		ri->ri_isref = opc->sreference;
+		BER_BVZERO( &ri->ri_cookie );
+		ldap_pvt_thread_mutex_init( &ri->ri_mutex );
+		opc->se = NULL;
+		opc->ssres.s_info = ri;
+	}
+	ri = opc->ssres.s_info;
+	sr->s_info = ri;
+	ldap_pvt_thread_mutex_lock( &ri->ri_mutex );
+	sr->s_rilist = ri->ri_list;
+	ri->ri_list = sr;
+	if ( mode == LDAP_SYNC_NEW_COOKIE && BER_BVISNULL( &ri->ri_cookie )) {
 		syncprov_info_t	*si = opc->son->on_bi.bi_private;
 
-		slap_compose_sync_cookie( NULL, &cookie, si->si_ctxcsn,
+		slap_compose_sync_cookie( NULL, &ri->ri_cookie, si->si_ctxcsn,
 			so->s_rid, slap_serverID ? slap_serverID : -1);
 	}
-
-	srsize = sizeof(syncres) + opc->suuid.bv_len + 1 +
-		opc->sdn.bv_len + 1 + opc->sndn.bv_len + 1;
-	if ( cookie.bv_len )
-		srsize += cookie.bv_len + 1;
-	sr = ch_malloc( srsize );
-	sr->s_next = NULL;
-	sr->s_e = opc->se;
-	/* bump refcount on this entry */
-	if ( opc->se )
-		inc_mutexint( opc->se->e_private );
-	sr->s_dn.bv_val = (char *)(sr + 1);
-	sr->s_dn.bv_len = opc->sdn.bv_len;
-	sr->s_mode = mode;
-	sr->s_isreference = opc->sreference;
-	sr->s_ndn.bv_val = lutil_strcopy( sr->s_dn.bv_val,
-		 opc->sdn.bv_val ) + 1;
-	sr->s_ndn.bv_len = opc->sndn.bv_len;
-	sr->s_uuid.bv_val = lutil_strcopy( sr->s_ndn.bv_val,
-		 opc->sndn.bv_val ) + 1;
-	sr->s_uuid.bv_len = opc->suuid.bv_len;
-	AC_MEMCPY( sr->s_uuid.bv_val, opc->suuid.bv_val, opc->suuid.bv_len );
-	if ( cookie.bv_len ) {
-		sr->s_csn.bv_val = sr->s_uuid.bv_val + sr->s_uuid.bv_len + 1;
-		strcpy( sr->s_csn.bv_val, cookie.bv_val );
-	} else {
-		sr->s_csn.bv_val = NULL;
-	}
-	sr->s_csn.bv_len = cookie.bv_len;
-
-	if ( mode == LDAP_SYNC_NEW_COOKIE && cookie.bv_val ) {
-		ch_free( cookie.bv_val );
-	}
+	ldap_pvt_thread_mutex_unlock( &ri->ri_mutex );
 
 	ldap_pvt_thread_mutex_lock( &so->s_mutex );
 	if ( !so->s_res ) {
@@ -1105,9 +1129,7 @@ syncprov_drop_psearch( syncops *so, int lock )
 		if ( lock )
 			ldap_pvt_thread_mutex_unlock( &so->s_op->o_conn->c_mutex );
 	}
-	syncprov_free_syncop( so );
-
-	return 0;
+	return syncprov_free_syncop( so, 0 );
 }
 
 static int
@@ -1115,7 +1137,7 @@ syncprov_ab_cleanup( Operation *op, SlapReply *rs )
 {
 	slap_callback *sc = op->o_callback;
 	op->o_callback = sc->sc_next;
-	syncprov_drop_psearch( op->o_callback->sc_private, 0 );
+	syncprov_drop_psearch( sc->sc_private, 0 );
 	op->o_tmpfree( sc, op->o_tmpmemctx );
 	return 0;
 }
@@ -1125,15 +1147,14 @@ syncprov_op_abandon( Operation *op, SlapReply *rs )
 {
 	slap_overinst		*on = (slap_overinst *)op->o_bd->bd_info;
 	syncprov_info_t		*si = on->on_bi.bi_private;
-	syncops *so, *soprev;
+	syncops *so, **sop;
 
 	ldap_pvt_thread_mutex_lock( &si->si_ops_mutex );
-	for ( so=si->si_ops, soprev = (syncops *)&si->si_ops; so;
-		soprev=so, so=so->s_next ) {
+	for ( sop=&si->si_ops; (so = *sop); sop = &(*sop)->s_next ) {
 		if ( so->s_op->o_connid == op->o_connid &&
 			so->s_op->o_msgid == op->orn_msgid ) {
 				so->s_op->o_abandon = 1;
-				soprev->s_next = so->s_next;
+				*sop = so->s_next;
 				break;
 		}
 	}
@@ -1150,6 +1171,7 @@ syncprov_op_abandon( Operation *op, SlapReply *rs )
 				cb->sc_cleanup = syncprov_ab_cleanup;
 				cb->sc_next = op->o_callback;
 				cb->sc_private = so;
+				op->o_callback = cb;
 				return SLAP_CB_CONTINUE;
 			}
 		}
@@ -1166,10 +1188,10 @@ syncprov_matchops( Operation *op, opcookie *opc, int saveit )
 	syncprov_info_t		*si = on->on_bi.bi_private;
 
 	fbase_cookie fc;
-	syncops *ss, *sprev, *snext;
+	syncops **pss;
 	Entry *e = NULL;
 	Attribute *a;
-	int rc;
+	int rc, gonext;
 	struct berval newdn;
 	int freefdn = 0;
 	BackendDB *b0 = op->o_bd, db;
@@ -1192,10 +1214,8 @@ syncprov_matchops( Operation *op, opcookie *opc, int saveit )
 		rc = overlay_entry_get_ov( op, fc.fdn, NULL, NULL, 0, &e, on );
 		/* If we're sending responses now, make a copy and unlock the DB */
 		if ( e && !saveit ) {
-			if ( !opc->se ) {
+			if ( !opc->se )
 				opc->se = entry_dup( e );
-				opc->se->e_private = get_mutexint();
-			}
 			overlay_entry_release_ov( op, e, 0, on );
 			e = opc->se;
 		}
@@ -1206,10 +1226,8 @@ syncprov_matchops( Operation *op, opcookie *opc, int saveit )
 	} else {
 		e = op->ora_e;
 		if ( !saveit ) {
-			if ( !opc->se ) {
+			if ( !opc->se )
 				opc->se = entry_dup( e );
-				opc->se->e_private = get_mutexint();
-			}
 			e = opc->se;
 		}
 	}
@@ -1229,15 +1247,15 @@ syncprov_matchops( Operation *op, opcookie *opc, int saveit )
 	}
 
 	ldap_pvt_thread_mutex_lock( &si->si_ops_mutex );
-	for (ss = si->si_ops, sprev = (syncops *)&si->si_ops; ss;
-		sprev = ss, ss=snext)
+	for (pss = &si->si_ops; *pss; pss = gonext ? &(*pss)->s_next : pss)
 	{
 		Operation op2;
 		Opheader oh;
 		syncmatches *sm;
 		int found = 0;
+		syncops *snext, *ss = *pss;
 
-		snext = ss->s_next;
+		gonext = 1;
 		if ( ss->s_op->o_abandon )
 			continue;
 
@@ -1266,9 +1284,10 @@ syncprov_matchops( Operation *op, opcookie *opc, int saveit )
 			SlapReply rs = {REP_RESULT};
 			send_ldap_error( ss->s_op, &rs, LDAP_SYNC_REFRESH_REQUIRED,
 				"search base has changed" );
-			sprev->s_next = snext;
-			syncprov_drop_psearch( ss, 1 );
-			ss = sprev;
+			snext = ss->s_next;
+			if ( syncprov_drop_psearch( ss, 1 ) )
+				*pss = snext;
+			gonext = 0;
 			continue;
 		}
 
@@ -1310,8 +1329,8 @@ syncprov_matchops( Operation *op, opcookie *opc, int saveit )
 				   phase otherwise (ITS#6555) */
 				op2.ors_filter = ss->s_op->ors_filter->f_and->f_next;
 			}
-			ldap_pvt_thread_mutex_unlock( &ss->s_mutex );
 			rc = test_filter( &op2, e, op2.ors_filter );
+			ldap_pvt_thread_mutex_unlock( &ss->s_mutex );
 		}
 
 		Debug( LDAP_DEBUG_TRACE, "syncprov_matchops: sid %03x fscope %d rc %d\n",
@@ -1342,7 +1361,11 @@ syncprov_matchops( Operation *op, opcookie *opc, int saveit )
 			/* Decrement s_inuse, was incremented when called
 			 * with saveit == TRUE
 			 */
-			syncprov_free_syncop( ss );
+			snext = ss->s_next;
+			if ( syncprov_free_syncop( ss, 0 ) ) {
+				*pss = snext;
+				gonext = 0;
+			}
 		}
 	}
 	ldap_pvt_thread_mutex_unlock( &si->si_ops_mutex );
@@ -1355,12 +1378,11 @@ syncprov_matchops( Operation *op, opcookie *opc, int saveit )
 			overlay_entry_release_ov( op, e, 0, on );
 		op->o_bd = b0;
 	}
-	if ( opc->se && !saveit ) {
-		if ( !dec_mutexint( opc->se->e_private )) {
-			opc->se->e_private = NULL;
+	if ( !saveit ) {
+		if ( opc->ssres.s_info )
+			free_resinfo( &opc->ssres );
+		else if ( opc->se )
 			entry_free( opc->se );
-			opc->se = NULL;
-		}
 	}
 	if ( freefdn ) {
 		op->o_tmpfree( fc.fdn->bv_val, op->o_tmpmemctx );
@@ -1385,7 +1407,7 @@ syncprov_op_cleanup( Operation *op, SlapReply *rs )
 
 	for (sm = opc->smatches; sm; sm=snext) {
 		snext = sm->sm_next;
-		syncprov_free_syncop( sm->sm_op );
+		syncprov_free_syncop( sm->sm_op, 1 );
 		op->o_tmpfree( sm, op->o_tmpmemctx );
 	}
 
@@ -1396,7 +1418,6 @@ syncprov_op_cleanup( Operation *op, SlapReply *rs )
 		mt->mt_mods = mt->mt_mods->mi_next;
 		/* If there are more, promote the next one */
 		if ( mt->mt_mods ) {
-			mt->mt_op = mt->mt_mods->mi_op;
 			ldap_pvt_thread_mutex_unlock( &mt->mt_mutex );
 		} else {
 			ldap_pvt_thread_mutex_unlock( &mt->mt_mutex );
@@ -1404,6 +1425,7 @@ syncprov_op_cleanup( Operation *op, SlapReply *rs )
 			avl_delete( &si->si_mods, mt, sp_avl_cmp );
 			ldap_pvt_thread_mutex_unlock( &si->si_mods_mutex );
 			ldap_pvt_thread_mutex_destroy( &mt->mt_mutex );
+			ch_free( mt->mt_dn.bv_val );
 			ch_free( mt );
 		}
 	}
@@ -1553,13 +1575,29 @@ syncprov_add_slog( Operation *op )
 		} else {
 			sl->sl_head = se;
 			sl->sl_tail = se;
+			if ( !sl->sl_mincsn ) {
+				sl->sl_numcsns = 1;
+				sl->sl_mincsn = ch_malloc( 2*sizeof( struct berval ));
+				sl->sl_sids = ch_malloc( sizeof( int ));
+				sl->sl_sids[0] = se->se_sid;
+				ber_dupbv( sl->sl_mincsn, &se->se_csn );
+				BER_BVZERO( &sl->sl_mincsn[1] );
+			}
 		}
 		sl->sl_num++;
 		while ( sl->sl_num > sl->sl_size ) {
+			int i, j;
 			se = sl->sl_head;
 			sl->sl_head = se->se_next;
-			AC_MEMCPY( sl->sl_mincsn.bv_val, se->se_csn.bv_val, se->se_csn.bv_len );
-			sl->sl_mincsn.bv_len = se->se_csn.bv_len;
+			for ( i=0; i<sl->sl_numcsns; i++ )
+				if ( sl->sl_sids[i] >= se->se_sid )
+					break;
+			if  ( i == sl->sl_numcsns || sl->sl_sids[i] != se->se_sid ) {
+				slap_insert_csn_sids( (struct sync_cookie *)sl,
+					i, se->se_sid, &se->se_csn );
+			} else {
+				ber_bvreplace( &sl->sl_mincsn[i], &se->se_csn );
+			}
 			ch_free( se );
 			sl->sl_num--;
 		}
@@ -1795,6 +1833,8 @@ syncprov_op_response( Operation *op, SlapReply *rs )
 #endif
 			sid = slap_parse_csn_sid( &maxcsn );
 			for ( i=0; i<si->si_numcsns; i++ ) {
+				if ( sid < si->si_sids[i] )
+					break;
 				if ( sid == si->si_sids[i] ) {
 					if ( ber_bvcmp( &maxcsn, &si->si_ctxcsn[i] ) > 0 ) {
 						ber_bvreplace( &si->si_ctxcsn[i], &maxcsn );
@@ -1804,13 +1844,10 @@ syncprov_op_response( Operation *op, SlapReply *rs )
 				}
 			}
 			/* It's a new SID for us */
-			if ( i == si->si_numcsns ) {
-				value_add_one( &si->si_ctxcsn, &maxcsn );
+			if ( i == si->si_numcsns || sid != si->si_sids[i] ) {
+				slap_insert_csn_sids((struct sync_cookie *)&(si->si_ctxcsn),
+					i, sid, &maxcsn );
 				csn_changed = 1;
-				si->si_numcsns++;
-				si->si_sids = ch_realloc( si->si_sids, si->si_numcsns *
-					sizeof(int));
-				si->si_sids[i] = sid;
 			}
 		}
 
@@ -1830,6 +1867,8 @@ syncprov_op_response( Operation *op, SlapReply *rs )
 			for ( i=0; i<mod->sml_numvals; i++ ) {
 				sid = slap_parse_csn_sid( &mod->sml_values[i] );
 				for ( j=0; j<si->si_numcsns; j++ ) {
+					if ( sid < si->si_sids[j] )
+						break;
 					if ( sid == si->si_sids[j] ) {
 						if ( ber_bvcmp( &mod->sml_values[i], &si->si_ctxcsn[j] ) > 0 ) {
 							ber_bvreplace( &si->si_ctxcsn[j], &mod->sml_values[i] );
@@ -1839,12 +1878,9 @@ syncprov_op_response( Operation *op, SlapReply *rs )
 					}
 				}
 
-				if ( j == si->si_numcsns ) {
-					value_add_one( &si->si_ctxcsn, &mod->sml_values[i] );
-					si->si_numcsns++;
-					si->si_sids = ch_realloc( si->si_sids, si->si_numcsns *
-						sizeof(int));
-					si->si_sids[j] = sid;
+				if ( j == si->si_numcsns || sid != si->si_sids[j] ) {
+					slap_insert_csn_sids( (struct sync_cookie *)&si->si_ctxcsn,
+						j, sid, &mod->sml_values[i] );
 					csn_changed = 1;
 				}
 			}
@@ -2051,6 +2087,9 @@ syncprov_op_mod( Operation *op, SlapReply *rs )
 			opc->rsid = scook->sid;
 	}
 
+	if ( op->o_dont_replicate )
+		return SLAP_CB_CONTINUE;
+
 	/* If there are active persistent searches, lock this operation.
 	 * See seqmod.c for the locking logic on its own.
 	 */
@@ -2062,7 +2101,7 @@ syncprov_op_mod( Operation *op, SlapReply *rs )
 		mi->mi_op = op;
 
 		/* See if we're already modifying this entry... */
-		mtdummy.mt_op = op;
+		mtdummy.mt_dn = op->o_req_ndn;
 		ldap_pvt_thread_mutex_lock( &si->si_mods_mutex );
 		mt = avl_find( si->si_mods, &mtdummy, sp_avl_cmp );
 		if ( mt ) {
@@ -2097,10 +2136,12 @@ syncprov_op_mod( Operation *op, SlapReply *rs )
 				/* clean up if the caller is giving up */
 				if ( op->o_abandon ) {
 					modinst *m2;
-					for ( m2 = mt->mt_mods; m2->mi_next != mi;
+					for ( m2 = mt->mt_mods; m2 && m2->mi_next != mi;
 						m2 = m2->mi_next );
-					m2->mi_next = mi->mi_next;
-					if ( mt->mt_tail == mi ) mt->mt_tail = m2;
+					if ( m2 ) {
+						m2->mi_next = mi->mi_next;
+						if ( mt->mt_tail == mi ) mt->mt_tail = m2;
+					}
 					op->o_tmpfree( cb, op->o_tmpmemctx );
 					ldap_pvt_thread_mutex_unlock( &mt->mt_mutex );
 					return SLAPD_ABANDON;
@@ -2112,7 +2153,7 @@ syncprov_op_mod( Operation *op, SlapReply *rs )
 			mt = ch_malloc( sizeof(modtarget) );
 			mt->mt_mods = mi;
 			mt->mt_tail = mi;
-			mt->mt_op = mi->mi_op;
+			ber_dupbv( &mt->mt_dn, &mi->mi_op->o_req_ndn );
 			ldap_pvt_thread_mutex_init( &mt->mt_mutex );
 			avl_insert( &si->si_mods, mt, sp_avl_cmp, avl_dup_error );
 			ldap_pvt_thread_mutex_unlock( &si->si_mods_mutex );
@@ -2145,17 +2186,6 @@ typedef struct searchstate {
 #define	SS_CHANGED	0x02
 	int ss_flags;
 } searchstate;
-
-static int
-syncprov_search_cleanup( Operation *op, SlapReply *rs )
-{
-	if ( rs->sr_ctrls ) {
-		op->o_tmpfree( rs->sr_ctrls[0], op->o_tmpmemctx );
-		op->o_tmpfree( rs->sr_ctrls, op->o_tmpmemctx );
-		rs->sr_ctrls = NULL;
-	}
-	return 0;
-}
 
 typedef struct SyncOperationBuffer {
 	Operation		sob_op;
@@ -2330,12 +2360,14 @@ syncprov_search_response( Operation *op, SlapReply *rs )
 		rs->sr_ctrls = op->o_tmpalloc( sizeof(LDAPControl *)*2,
 			op->o_tmpmemctx );
 		rs->sr_ctrls[1] = NULL;
+		rs->sr_flags |= REP_CTRLS_MUSTBEFREED;
 		/* If we're in delta-sync mode, always send a cookie */
 		if ( si->si_nopres && si->si_usehint && a ) {
 			struct berval cookie;
 			slap_compose_sync_cookie( op, &cookie, a->a_nvals, srs->sr_state.rid, slap_serverID ? slap_serverID : -1 );
 			rs->sr_err = syncprov_state_ctrl( op, rs, rs->sr_entry,
 				LDAP_SYNC_ADD, rs->sr_ctrls, 0, 1, &cookie );
+			op->o_tmpfree( cookie.bv_val, op->o_tmpmemctx );
 		} else {
 			rs->sr_err = syncprov_state_ctrl( op, rs, rs->sr_entry,
 				LDAP_SYNC_ADD, rs->sr_ctrls, 0, 0, NULL );
@@ -2358,6 +2390,7 @@ syncprov_search_response( Operation *op, SlapReply *rs )
 			rs->sr_ctrls = op->o_tmpalloc( sizeof(LDAPControl *)*2,
 				op->o_tmpmemctx );
 			rs->sr_ctrls[1] = NULL;
+			rs->sr_flags |= REP_CTRLS_MUSTBEFREED;
 			rs->sr_err = syncprov_done_ctrl( op, rs, rs->sr_ctrls,
 				0, 1, &cookie, ( ss->ss_flags & SS_PRESENT ) ?  LDAP_SYNC_REFRESH_PRESENTS :
 					LDAP_SYNC_REFRESH_DELETES );
@@ -2415,6 +2448,7 @@ syncprov_op_search( Operation *op, SlapReply *rs )
 	BerVarray ctxcsn;
 	int i, *sids, numcsns;
 	struct berval mincsn, maxcsn;
+	int minsid, maxsid;
 	int dirty = 0;
 
 	if ( !(op->o_sync_mode & SLAP_SYNC_REFRESH) ) return SLAP_CB_CONTINUE;
@@ -2457,7 +2491,10 @@ syncprov_op_search( Operation *op, SlapReply *rs )
 		ldap_pvt_thread_mutex_init( &sop->s_mutex );
 		sop->s_rid = srs->sr_state.rid;
 		sop->s_sid = srs->sr_state.sid;
-		sop->s_inuse = 1;
+		/* set refcount=2 to prevent being freed out from under us
+		 * by abandons that occur while we're running here
+		 */
+		sop->s_inuse = 2;
 
 		ldap_pvt_thread_mutex_lock( &si->si_ops_mutex );
 		while ( si->si_active ) {
@@ -2468,13 +2505,16 @@ syncprov_op_search( Operation *op, SlapReply *rs )
 			 * active mods gets added to it.
 			 */
 			ldap_pvt_thread_mutex_unlock( &si->si_ops_mutex );
-			if ( slapd_shutdown )
+			if ( slapd_shutdown ) {
+				ch_free( sop );
 				return SLAPD_ABANDON;
+			}
 			if ( !ldap_pvt_thread_pool_pausecheck( &connection_pool ))
 				ldap_pvt_thread_yield();
 			ldap_pvt_thread_mutex_lock( &si->si_ops_mutex );
 		}
 		sop->s_next = si->si_ops;
+		sop->s_si = si;
 		si->si_ops = sop;
 		ldap_pvt_thread_mutex_unlock( &si->si_ops_mutex );
 	}
@@ -2510,111 +2550,134 @@ syncprov_op_search( Operation *op, SlapReply *rs )
 
 		/* If there are SIDs we don't recognize in the cookie, drop them */
 		for (i=0; i<srs->sr_state.numcsns; ) {
-			for (j=0; j<numcsns; j++) {
-				if ( srs->sr_state.sids[i] == sids[j] ) {
+			for (j=i; j<numcsns; j++) {
+				if ( srs->sr_state.sids[i] <= sids[j] ) {
 					break;
 				}
 			}
 			/* not found */
-			if ( j == numcsns ) {
-				struct berval tmp = srs->sr_state.ctxcsn[i];
-				j = srs->sr_state.numcsns - 1;
-				srs->sr_state.ctxcsn[i] = srs->sr_state.ctxcsn[j];
-				tmp.bv_len = 0;
-				srs->sr_state.ctxcsn[j] = tmp;
-				srs->sr_state.numcsns = j;
-				srs->sr_state.sids[i] = srs->sr_state.sids[j];
+			if ( j == numcsns || srs->sr_state.sids[i] != sids[j] ) {
+				char *tmp = srs->sr_state.ctxcsn[i].bv_val;
+				srs->sr_state.numcsns--;
+				for ( j=i; j<srs->sr_state.numcsns; j++ ) {
+					srs->sr_state.ctxcsn[j] = srs->sr_state.ctxcsn[j+1];
+					srs->sr_state.sids[j] = srs->sr_state.sids[j+1];
+				}
+				srs->sr_state.ctxcsn[j].bv_val = tmp;
+				srs->sr_state.ctxcsn[j].bv_len = 0;
 				continue;
 			}
 			i++;
 		}
 
+		if (srs->sr_state.numcsns != numcsns) {
+			/* consumer doesn't have the right number of CSNs */
+			changed = SS_CHANGED;
+			if ( srs->sr_state.ctxcsn ) {
+				ber_bvarray_free_x( srs->sr_state.ctxcsn, op->o_tmpmemctx );
+				srs->sr_state.ctxcsn = NULL;
+			}
+			if ( srs->sr_state.sids ) {
+				slap_sl_free( srs->sr_state.sids, op->o_tmpmemctx );
+				srs->sr_state.sids = NULL;
+			}
+			srs->sr_state.numcsns = 0;
+			goto shortcut;
+		}
+
 		/* Find the smallest CSN which differs from contextCSN */
 		mincsn.bv_len = 0;
 		maxcsn.bv_len = 0;
-		for ( i=0; i<srs->sr_state.numcsns; i++ ) {
-			for ( j=0; j<numcsns; j++ ) {
-				if ( srs->sr_state.sids[i] != sids[j] )
-					continue;
-				if ( BER_BVISEMPTY( &maxcsn ) || ber_bvcmp( &maxcsn,
-					&srs->sr_state.ctxcsn[i] ) < 0 ) {
-					maxcsn = srs->sr_state.ctxcsn[i];
+		for ( i=0,j=0; i<srs->sr_state.numcsns; i++ ) {
+			int newer;
+			while ( srs->sr_state.sids[i] != sids[j] ) j++;
+			if ( BER_BVISEMPTY( &maxcsn ) || ber_bvcmp( &maxcsn,
+				&srs->sr_state.ctxcsn[i] ) < 0 ) {
+				maxcsn = srs->sr_state.ctxcsn[i];
+				maxsid = sids[j];
+			}
+			newer = ber_bvcmp( &srs->sr_state.ctxcsn[i], &ctxcsn[j] );
+			/* If our state is newer, tell consumer about changes */
+			if ( newer < 0) {
+				changed = SS_CHANGED;
+				if ( BER_BVISEMPTY( &mincsn ) || ber_bvcmp( &mincsn,
+					&srs->sr_state.ctxcsn[i] ) > 0 ) {
+					mincsn = srs->sr_state.ctxcsn[i];
+					minsid = sids[j];
 				}
-				if ( ber_bvcmp( &srs->sr_state.ctxcsn[i], &ctxcsn[j] ) < 0) {
-					if ( BER_BVISEMPTY( &mincsn ) || ber_bvcmp( &mincsn,
-						&srs->sr_state.ctxcsn[i] ) > 0 ) {
-						mincsn = srs->sr_state.ctxcsn[i];
-					}
+			} else if ( newer > 0 && sids[j] == slap_serverID ) {
+			/* our state is older, complain to consumer */
+				rs->sr_err = LDAP_UNWILLING_TO_PERFORM;
+				rs->sr_text = "consumer state is newer than provider!";
+bailout:
+				if ( sop ) {
+					syncops **sp = &si->si_ops;
+
+					ldap_pvt_thread_mutex_lock( &si->si_ops_mutex );
+					while ( *sp != sop )
+						sp = &(*sp)->s_next;
+					*sp = sop->s_next;
+					ldap_pvt_thread_mutex_unlock( &si->si_ops_mutex );
+					ch_free( sop );
 				}
+				rs->sr_ctrls = NULL;
+				send_ldap_result( op, rs );
+				return rs->sr_err;
 			}
  		}
-		if ( BER_BVISEMPTY( &mincsn ))
+		if ( BER_BVISEMPTY( &mincsn )) {
 			mincsn = maxcsn;
+			minsid = maxsid;
+		}
 
 		/* If nothing has changed, shortcut it */
-		if ( srs->sr_state.numcsns == numcsns ) {
-			int i, j, newer;
-			for ( i=0; i<srs->sr_state.numcsns; i++ ) {
-				for ( j=0; j<numcsns; j++ ) {
-					if ( srs->sr_state.sids[i] != sids[j] )
-						continue;
-					newer = ber_bvcmp( &srs->sr_state.ctxcsn[i], &ctxcsn[j] );
-					/* If our state is newer, tell consumer about changes */
-					if ( newer < 0 )
-						changed = SS_CHANGED;
-					else if ( newer > 0 ) {
-					/* our state is older, complain to consumer */
-						rs->sr_err = LDAP_UNWILLING_TO_PERFORM;
-						rs->sr_text = "consumer state is newer than provider!";
-bailout:
-						if ( sop ) {
-							syncops **sp = &si->si_ops;
-							
-							ldap_pvt_thread_mutex_lock( &si->si_ops_mutex );
-							while ( *sp != sop )
-								sp = &(*sp)->s_next;
-							*sp = sop->s_next;
-							ldap_pvt_thread_mutex_unlock( &si->si_ops_mutex );
-							ch_free( sop );
-						}
-						rs->sr_ctrls = NULL;
-						send_ldap_result( op, rs );
-						return rs->sr_err;
-					}
-					break;
-				}
-				if ( changed )
-					break;
-			}
-			if ( !changed && !dirty ) {
-				do_present = 0;
+		if ( !changed && !dirty ) {
+			do_present = 0;
 no_change:		if ( !(op->o_sync_mode & SLAP_SYNC_PERSIST) ) {
-					LDAPControl	*ctrls[2];
+				LDAPControl	*ctrls[2];
 
-					ctrls[0] = NULL;
-					ctrls[1] = NULL;
-					syncprov_done_ctrl( op, rs, ctrls, 0, 0,
-						NULL, LDAP_SYNC_REFRESH_DELETES );
-					rs->sr_ctrls = ctrls;
-					rs->sr_err = LDAP_SUCCESS;
-					send_ldap_result( op, rs );
-					rs->sr_ctrls = NULL;
-					return rs->sr_err;
-				}
-				goto shortcut;
+				ctrls[0] = NULL;
+				ctrls[1] = NULL;
+				syncprov_done_ctrl( op, rs, ctrls, 0, 0,
+					NULL, LDAP_SYNC_REFRESH_DELETES );
+				rs->sr_ctrls = ctrls;
+				rs->sr_err = LDAP_SUCCESS;
+				send_ldap_result( op, rs );
+				rs->sr_ctrls = NULL;
+				return rs->sr_err;
 			}
-		} else {
-			/* consumer doesn't have the right number of CSNs */
-			changed = SS_CHANGED;
+			goto shortcut;
 		}
+
 		/* Do we have a sessionlog for this search? */
 		sl=si->si_logs;
 		if ( sl ) {
+			int do_play = 0;
 			ldap_pvt_thread_mutex_lock( &sl->sl_mutex );
 			/* Are there any log entries, and is the consumer state
 			 * present in the session log?
 			 */
-			if ( sl->sl_num > 0 && ber_bvcmp( &mincsn, &sl->sl_mincsn ) >= 0 ) {
+			if ( sl->sl_num > 0 ) {
+				int i;
+				for ( i=0; i<sl->sl_numcsns; i++ ) {
+					/* SID not present == new enough */
+					if ( minsid < sl->sl_sids[i] ) {
+						do_play = 1;
+						break;
+					}
+					/* SID present */
+					if ( minsid == sl->sl_sids[i] ) {
+						/* new enough? */
+						if ( ber_bvcmp( &mincsn, &sl->sl_mincsn[i] ) >= 0 )
+							do_play = 1;
+						break;
+					}
+				}
+				/* SID not present == new enough */
+				if ( i == sl->sl_numcsns )
+					do_play = 1;
+			}
+			if ( do_play ) {
 				do_present = 0;
 				/* mutex is unlocked in playlog */
 				syncprov_playlog( op, rs, sl, srs, ctxcsn, numcsns, sids );
@@ -2623,7 +2686,7 @@ no_change:		if ( !(op->o_sync_mode & SLAP_SYNC_PERSIST) ) {
 			}
 		}
 		/* Is the CSN still present in the database? */
-		if ( syncprov_findcsn( op, FIND_CSN ) != LDAP_SUCCESS ) {
+		if ( syncprov_findcsn( op, FIND_CSN, &mincsn ) != LDAP_SUCCESS ) {
 			/* No, so a reload is required */
 			/* the 2.2 consumer doesn't send this hint */
 			if ( si->si_usehint && srs->sr_rhint == 0 ) {
@@ -2647,7 +2710,7 @@ no_change:		if ( !(op->o_sync_mode & SLAP_SYNC_PERSIST) ) {
 		} else {
 			gotstate = 1;
 			/* If changed and doing Present lookup, send Present UUIDs */
-			if ( do_present && syncprov_findcsn( op, FIND_PRESENT ) !=
+			if ( do_present && syncprov_findcsn( op, FIND_PRESENT, 0 ) !=
 				LDAP_SUCCESS ) {
 				if ( ctxcsn )
 					ber_bvarray_free_x( ctxcsn, op->o_tmpmemctx );
@@ -2666,7 +2729,10 @@ shortcut:
 	 * for persistent search evaluation
 	 */
 	if ( sop ) {
-		sop->s_filterstr= op->ors_filterstr;
+		ldap_pvt_thread_mutex_lock( &sop->s_mutex );
+		sop->s_filterstr = op->ors_filterstr;
+		/* correct the refcount that was set to 2 before */
+		sop->s_inuse--;
 	}
 
 	/* If something changed, find the changes */
@@ -2686,14 +2752,14 @@ shortcut:
 #endif
 		ber_dupbv_x( &fava->f_ava->aa_value, &mincsn, op->o_tmpmemctx );
 		fava->f_next = op->ors_filter;
-		if ( sop )
-			ldap_pvt_thread_mutex_lock( &sop->s_mutex );
 		op->ors_filter = fand;
 		filter2bv_x( op, op->ors_filter, &op->ors_filterstr );
 		if ( sop ) {
 			sop->s_flags |= PS_FIX_FILTER;
-			ldap_pvt_thread_mutex_unlock( &sop->s_mutex );
 		}
+	}
+	if ( sop ) {
+		ldap_pvt_thread_mutex_unlock( &sop->s_mutex );
 	}
 
 	/* Let our callback add needed info to returned entries */
@@ -2706,7 +2772,6 @@ shortcut:
 	ss->ss_numcsns = numcsns;
 	ss->ss_sids = sids;
 	cb->sc_response = syncprov_search_response;
-	cb->sc_cleanup = syncprov_search_cleanup;
 	cb->sc_private = ss;
 	cb->sc_next = op->o_callback;
 	op->o_callback = cb;
@@ -2761,7 +2826,7 @@ syncprov_operational(
 				}
 
 				if ( !ap ) {
-					if ( rs_ensure_entry_modifiable( op, rs, on )) {
+					if ( rs_entry2modifiable( op, rs, on )) {
 						a = attr_find( rs->sr_entry->e_attrs,
 							slap_schema.si_ad_contextCSN );
 					}
@@ -2946,10 +3011,11 @@ sp_cf_gen(ConfigArgs *c)
 		}
 		sl = si->si_logs;
 		if ( !sl ) {
-			sl = ch_malloc( sizeof( sessionlog ) + LDAP_PVT_CSNSTR_BUFSIZE );
-			sl->sl_mincsn.bv_val = (char *)(sl+1);
-			sl->sl_mincsn.bv_len = 0;
+			sl = ch_malloc( sizeof( sessionlog ));
+			sl->sl_mincsn = NULL;
+			sl->sl_sids = NULL;
 			sl->sl_num = 0;
+			sl->sl_numcsns = 0;
 			sl->sl_head = sl->sl_tail = NULL;
 			ldap_pvt_thread_mutex_init( &sl->sl_mutex );
 			si->si_logs = sl;
@@ -2975,9 +3041,10 @@ syncprov_db_otask(
 	void *ptr
 )
 {
-	syncprov_findcsn( ptr, FIND_MAXCSN );
+	syncprov_findcsn( ptr, FIND_MAXCSN, 0 );
 	return NULL;
 }
+
 
 /* Read any existing contextCSN from the underlying db.
  * Then search for any entries newer than that. If no value exists,
@@ -3039,9 +3106,11 @@ syncprov_db_open(
 			ber_bvarray_dup_x( &si->si_ctxcsn, a->a_vals, NULL );
 			si->si_numcsns = a->a_numvals;
 			si->si_sids = slap_parse_csn_sids( si->si_ctxcsn, a->a_numvals, NULL );
+			slap_sort_csn_sids( si->si_ctxcsn, si->si_sids, si->si_numcsns, NULL );
 		}
 		overlay_entry_release_ov( op, e, 0, on );
 		if ( si->si_ctxcsn && !SLAP_DBCLEAN( be )) {
+			op->o_tag = LDAP_REQ_SEARCH;
 			op->o_req_dn = be->be_suffix[0];
 			op->o_req_ndn = be->be_nsuffix[0];
 			op->ors_scope = LDAP_SCOPE_SUBTREE;
@@ -3078,14 +3147,11 @@ syncprov_db_open(
 	if ( si->si_logs && si->si_numcsns ) {
 		sessionlog *sl = si->si_logs;
 		int i;
-		/* If there are multiple, find the newest */
-		for ( i=0; i < si->si_numcsns; i++ ) {
-			if ( ber_bvcmp( &sl->sl_mincsn, &si->si_ctxcsn[i] ) < 0 ) {
-				AC_MEMCPY( sl->sl_mincsn.bv_val, si->si_ctxcsn[i].bv_val,
-					si->si_ctxcsn[i].bv_len );
-				sl->sl_mincsn.bv_len = si->si_ctxcsn[i].bv_len;
-			}
-		}
+		ber_bvarray_dup_x( &sl->sl_mincsn, si->si_ctxcsn, NULL );
+		sl->sl_numcsns = si->si_numcsns;
+		sl->sl_sids = ch_malloc( si->si_numcsns * sizeof(int) );
+		for ( i=0; i < si->si_numcsns; i++ )
+			sl->sl_sids[i] = si->si_sids[i];
 	}
 
 out:
@@ -3126,16 +3192,18 @@ syncprov_db_close(
 	}
 
 #ifdef SLAP_CONFIG_DELETE
-	ldap_pvt_thread_mutex_lock( &si->si_ops_mutex );
-	for ( so=si->si_ops, sonext=so;  so; so=sonext  ) {
-		SlapReply rs = {REP_RESULT};
-		rs.sr_err = LDAP_UNAVAILABLE;
-		send_ldap_result( so->s_op, &rs );
-		sonext=so->s_next;
-		syncprov_drop_psearch( so, 0);
+	if ( !slapd_shutdown ) {
+		ldap_pvt_thread_mutex_lock( &si->si_ops_mutex );
+		for ( so=si->si_ops, sonext=so;  so; so=sonext  ) {
+			SlapReply rs = {REP_RESULT};
+			rs.sr_err = LDAP_UNAVAILABLE;
+			send_ldap_result( so->s_op, &rs );
+			sonext=so->s_next;
+			syncprov_drop_psearch( so, 0);
+		}
+		si->si_ops=NULL;
+		ldap_pvt_thread_mutex_unlock( &si->si_ops_mutex );
 	}
-	si->si_ops=NULL;
-	ldap_pvt_thread_mutex_unlock( &si->si_ops_mutex );
 	overlay_unregister_control( be, LDAP_CONTROL_SYNC );
 #endif /* SLAP_CONFIG_DELETE */
 
@@ -3187,14 +3255,19 @@ syncprov_db_destroy(
 
 	if ( si ) {
 		if ( si->si_logs ) {
-			slog_entry *se = si->si_logs->sl_head;
+			sessionlog *sl = si->si_logs;
+			slog_entry *se = sl->sl_head;
 
 			while ( se ) {
 				slog_entry *se_next = se->se_next;
 				ch_free( se );
 				se = se_next;
 			}
-				
+			if ( sl->sl_mincsn )
+				ber_bvarray_free( sl->sl_mincsn );
+			if ( sl->sl_sids )
+				ch_free( sl->sl_sids );
+
 			ldap_pvt_thread_mutex_destroy(&si->si_logs->sl_mutex);
 			ch_free( si->si_logs );
 		}

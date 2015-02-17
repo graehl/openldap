@@ -2,7 +2,7 @@
 /* $OpenLDAP$ */
 /* This work is part of OpenLDAP Software <http://www.openldap.org/>.
  *
- * Copyright 2005-2011 The OpenLDAP Foundation.
+ * Copyright 2005-2015 The OpenLDAP Foundation.
  * Portions copyright 2005 Symas Corporation.
  * All rights reserved.
  *
@@ -297,7 +297,7 @@ valsort_response( Operation *op, SlapReply *rs )
 		a = attr_find( rs->sr_entry->e_attrs, vi->vi_ad );
 		if ( !a ) continue;
 
-		if ( rs_ensure_entry_modifiable( op, rs, on )) {
+		if ( rs_entry2modifiable( op, rs, on )) {
 			a = attr_find( rs->sr_entry->e_attrs, vi->vi_ad );
 		}
 

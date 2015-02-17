@@ -2,7 +2,7 @@
 /* $OpenLDAP$ */
 /* This work is part of OpenLDAP Software <http://www.openldap.org/>.
  *
- * Copyright 1998-2011 The OpenLDAP Foundation.
+ * Copyright 1998-2015 The OpenLDAP Foundation.
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -88,6 +88,8 @@ attr_alloc( AttributeDescription *ad )
 	ldap_pvt_thread_mutex_unlock( &attr_mutex );
 	
 	a->a_desc = ad;
+	if ( ad && ( ad->ad_type->sat_flags & SLAP_AT_SORTED_VAL ))
+		a->a_flags |= SLAP_ATTR_SORTED_VALS;
 
 	return a;
 }
@@ -230,13 +232,16 @@ attr_dup2( Attribute *tmp, Attribute *a )
 		if ( a->a_nvals != a->a_vals ) {
 
 			tmp->a_nvals = ch_malloc( (tmp->a_numvals + 1) * sizeof(struct berval) );
-			for ( j = 0; !BER_BVISNULL( &a->a_nvals[j] ); j++ ) {
-				assert( j < i );
-				ber_dupbv( &tmp->a_nvals[j], &a->a_nvals[j] );
-				if ( BER_BVISNULL( &tmp->a_nvals[j] ) ) break;
-				/* FIXME: error? */
+			j = 0;
+			if ( i ) {
+				for ( ; !BER_BVISNULL( &a->a_nvals[j] ); j++ ) {
+					assert( j < i );
+					ber_dupbv( &tmp->a_nvals[j], &a->a_nvals[j] );
+					if ( BER_BVISNULL( &tmp->a_nvals[j] ) ) break;
+					/* FIXME: error? */
+				}
+				assert( j == i );
 			}
-			assert( j == i );
 			BER_BVZERO( &tmp->a_nvals[j] );
 
 		} else {

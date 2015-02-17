@@ -2,7 +2,7 @@
 /* $OpenLDAP$ */
 /* This work is part of OpenLDAP Software <http://www.openldap.org/>.
  *
- * Copyright 2003-2011 The OpenLDAP Foundation.
+ * Copyright 2003-2015 The OpenLDAP Foundation.
  * Portions Copyright 1999-2003 Howard Chu.
  * Portions Copyright 2000-2003 Pierangelo Masarati.
  * All rights reserved.
@@ -34,9 +34,6 @@
 #include "back-ldap.h"
 #include "lutil.h"
 #include "ldif.h"
-#undef ldap_debug
-/* for advanced URL parsing */
-#include "../../../libraries/libldap/ldap-int.h"
 
 static SLAP_EXTOP_MAIN_FN ldap_back_exop_whoami;
 
@@ -74,8 +71,10 @@ enum {
 	LDAP_BACK_CFG_ST_REQUEST,
 	LDAP_BACK_CFG_NOREFS,
 	LDAP_BACK_CFG_NOUNDEFFILTER,
+	LDAP_BACK_CFG_ONERR,
 
 	LDAP_BACK_CFG_REWRITE,
+	LDAP_BACK_CFG_KEEPALIVE,
 
 	LDAP_BACK_CFG_LAST
 };
@@ -328,6 +327,14 @@ static ConfigTable ldapcfg[] = {
 			"SYNTAX OMsBoolean "
 			"SINGLE-VALUE )",
 		NULL, NULL },
+	{ "onerr", "CONTINUE|report|stop", 2, 2, 0,
+		ARG_MAGIC|LDAP_BACK_CFG_ONERR,
+		ldap_back_cf_gen, "( OLcfgDbAt:3.108 "
+			"NAME 'olcDbOnErr' "
+			"DESC 'error handling' "
+			"SYNTAX OMsDirectoryString "
+			"SINGLE-VALUE )",
+		NULL, NULL },
 	{ "idassert-passThru", "authzRule", 2, 2, 0,
 		ARG_MAGIC|LDAP_BACK_CFG_IDASSERT_PASSTHRU,
 		ldap_back_cf_gen, "( OLcfgDbAt:3.27 "
@@ -347,6 +354,14 @@ static ConfigTable ldapcfg[] = {
 	{ "rewrite", "<arglist>", 2, 4, STRLENOF( "rewrite" ),
 		ARG_STRING|ARG_MAGIC|LDAP_BACK_CFG_REWRITE,
 		ldap_back_cf_gen, NULL, NULL, NULL },
+	{ "keepalive", "keepalive", 2, 2, 0,
+		ARG_MAGIC|LDAP_BACK_CFG_KEEPALIVE,
+		ldap_back_cf_gen, "( OLcfgDbAt:3.29 "
+			"NAME 'olcDbKeepalive' "
+			"DESC 'TCP keepalive' "
+			"SYNTAX OMsDirectoryString "
+			"SINGLE-VALUE )",
+		NULL, NULL },
 	{ NULL, NULL, 0, 0, 0, ARG_IGNORED,
 		NULL, NULL, NULL, NULL }
 };
@@ -386,6 +401,8 @@ static ConfigOCs ldapocs[] = {
 #endif /* SLAP_CONTROL_X_SESSION_TRACKING */
 			"$ olcDbNoRefs "
 			"$ olcDbNoUndefFilter "
+			"$ olcDbOnErr "
+			"$ olcDbKeepalive "
 		") )",
 		 	Cft_Database, ldapcfg},
 	{ NULL, 0, NULL }
@@ -472,6 +489,13 @@ static slap_verbmasks cancel_mode[] = {
 	{ BER_BVC( "exop" ),		LDAP_BACK_F_CANCEL_EXOP },
 	{ BER_BVC( "exop-discover" ),	LDAP_BACK_F_CANCEL_EXOP_DISCOVER },
 	{ BER_BVC( "abandon" ),		LDAP_BACK_F_CANCEL_ABANDON },
+	{ BER_BVNULL,			0 }
+};
+
+static slap_verbmasks onerr_mode[] = {
+	{ BER_BVC( "stop" ),		LDAP_BACK_F_ONERR_STOP },
+	{ BER_BVC( "report" ),		LDAP_BACK_F_ONERR_STOP }, /* same behavior */
+	{ BER_BVC( "continue" ),	LDAP_BACK_F_NONE },
 	{ BER_BVNULL,			0 }
 };
 
@@ -643,7 +667,7 @@ slap_retry_info_destroy(
 	ri->ri_num = NULL;
 }
 
-static int
+int
 slap_idassert_authzfrom_parse( ConfigArgs *c, slap_idassert_t *si )
 {
 	struct berval	bv;
@@ -656,9 +680,9 @@ slap_idassert_authzfrom_parse( ConfigArgs *c, slap_idassert_t *si )
  	{
  		if ( si->si_authz != NULL ) {
  			snprintf( c->cr_msg, sizeof( c->cr_msg ),
- 				"\"idassert-authzFrom <authz>\": "
+ 				"\"%s <authz>\": "
  				"\"%s\" conflicts with existing authz rules",
- 				c->argv[ 1 ] );
+ 				c->argv[ 0 ], c->argv[ 1 ] );
  			Debug( LDAP_DEBUG_ANY, "%s: %s.\n", c->log, c->cr_msg, 0 );
  			return 1;
  		}
@@ -669,8 +693,8 @@ slap_idassert_authzfrom_parse( ConfigArgs *c, slap_idassert_t *si )
  
  	} else if ( ( si->si_flags & LDAP_BACK_AUTH_AUTHZ_ALL ) ) {
   		snprintf( c->cr_msg, sizeof( c->cr_msg ),
-  			"\"idassert-authzFrom <authz>\": "
- 			"\"<authz>\" conflicts with \"*\"" );
+  			"\"%s <authz>\": "
+ 			"\"<authz>\" conflicts with \"*\"", c->argv[0] );
   		Debug( LDAP_DEBUG_ANY, "%s: %s.\n", c->log, c->cr_msg, 0 );
   		return 1;
   	}
@@ -679,8 +703,8 @@ slap_idassert_authzfrom_parse( ConfigArgs *c, slap_idassert_t *si )
  	rc = authzNormalize( 0, NULL, NULL, &in, &bv, NULL );
  	if ( rc != LDAP_SUCCESS ) {
  		snprintf( c->cr_msg, sizeof( c->cr_msg ),
- 			"\"idassert-authzFrom <authz>\": "
- 			"invalid syntax" );
+ 			"\"%s <authz>\": "
+ 			"invalid syntax", c->argv[0] );
  		Debug( LDAP_DEBUG_ANY, "%s: %s.\n", c->log, c->cr_msg, 0 );
  		return 1;
  	}
@@ -726,8 +750,8 @@ slap_idassert_passthru_parse( ConfigArgs *c, slap_idassert_t *si )
  	rc = authzNormalize( 0, NULL, NULL, &in, &bv, NULL );
  	if ( rc != LDAP_SUCCESS ) {
  		snprintf( c->cr_msg, sizeof( c->cr_msg ),
- 			"\"idassert-passThru <authz>\": "
- 			"invalid syntax" );
+ 			"\"%s <authz>\": "
+ 			"invalid syntax", c->argv[0] );
  		Debug( LDAP_DEBUG_ANY, "%s: %s.\n", c->log, c->cr_msg, 0 );
  		return 1;
  	}
@@ -762,7 +786,7 @@ slap_idassert_passthru_parse( ConfigArgs *c, slap_idassert_t *si )
 	return 0;
 }
 
-static int
+int
 slap_idassert_parse( ConfigArgs *c, slap_idassert_t *si )
 {
 	int		i;
@@ -775,9 +799,9 @@ slap_idassert_parse( ConfigArgs *c, slap_idassert_t *si )
 			j = verb_to_mask( argvi, idassert_mode );
 			if ( BER_BVISNULL( &idassert_mode[ j ].word ) ) {
 				snprintf( c->cr_msg, sizeof( c->cr_msg ),
-					"\"idassert-bind <args>\": "
+					"\"%s <args>\": "
 					"unknown mode \"%s\"",
-					argvi );
+					c->argv[0], argvi );
 				Debug( LDAP_DEBUG_ANY, "%s: %s.\n", c->log, c->cr_msg, 0 );
 				return 1;
 			}
@@ -790,9 +814,9 @@ slap_idassert_parse( ConfigArgs *c, slap_idassert_t *si )
 			if ( strcasecmp( argvi, "native" ) == 0 ) {
 				if ( si->si_bc.sb_method != LDAP_AUTH_SASL ) {
 					snprintf( c->cr_msg, sizeof( c->cr_msg ),
-						"\"idassert-bind <args>\": "
+						"\"%s <args>\": "
 						"authz=\"native\" incompatible "
-						"with auth method" );
+						"with auth method", c->argv[0] );
 					Debug( LDAP_DEBUG_ANY, "%s: %s.\n", c->log, c->cr_msg, 0 );
 					return 1;
 				}
@@ -803,9 +827,9 @@ slap_idassert_parse( ConfigArgs *c, slap_idassert_t *si )
 
 			} else {
 				snprintf( c->cr_msg, sizeof( c->cr_msg ),
-					"\"idassert-bind <args>\": "
+					"\"%s <args>\": "
 					"unknown authz \"%s\"",
-					argvi );
+					c->argv[0], argvi );
 				Debug( LDAP_DEBUG_ANY, "%s: %s.\n", c->log, c->cr_msg, 0 );
 				return 1;
 			}
@@ -817,9 +841,9 @@ slap_idassert_parse( ConfigArgs *c, slap_idassert_t *si )
 
 			if ( flags == NULL ) {
 				snprintf( c->cr_msg, sizeof( c->cr_msg ),
-					"\"idassert-bind <args>\": "
+					"\"%s <args>\": "
 					"unable to parse flags \"%s\"",
-					argvi );
+					c->argv[0], argvi );
 				Debug( LDAP_DEBUG_ANY, "%s: %s.\n", c->log, c->cr_msg, 0 );
 				return 1;
 			}
@@ -837,11 +861,12 @@ slap_idassert_parse( ConfigArgs *c, slap_idassert_t *si )
 
 				} else if ( strcasecmp( flags[ j ], "obsolete-proxy-authz" ) == 0 ) {
 					if ( si->si_flags & LDAP_BACK_AUTH_OBSOLETE_ENCODING_WORKAROUND ) {
-						Debug( LDAP_DEBUG_ANY,
-                                      		 		"%s: \"obsolete-proxy-authz\" flag "
-                                      		 		"in \"idassert-mode <args>\" "
-                                      		 		"incompatible with previously issued \"obsolete-encoding-workaround\" flag.\n",
-                                      	 			c->log, 0, 0 );
+						snprintf( c->cr_msg, sizeof( c->cr_msg ),
+							"\"%s <args>\": "
+							"\"obsolete-proxy-authz\" flag "
+							"incompatible with previously issued \"obsolete-encoding-workaround\" flag.",
+							c->argv[0] );
+						Debug( LDAP_DEBUG_ANY, "%s: %s.\n", c->log, c->cr_msg, 0 );
 						err = 1;
 						break;
 
@@ -851,11 +876,12 @@ slap_idassert_parse( ConfigArgs *c, slap_idassert_t *si )
 
 				} else if ( strcasecmp( flags[ j ], "obsolete-encoding-workaround" ) == 0 ) {
 					if ( si->si_flags & LDAP_BACK_AUTH_OBSOLETE_PROXY_AUTHZ ) {
-						Debug( LDAP_DEBUG_ANY,
-                                      	 			"%s: \"obsolete-encoding-workaround\" flag "
-                                       			"in \"idassert-mode <args>\" "
-                                       			"incompatible with previously issued \"obsolete-proxy-authz\" flag.\n",
-                                       			c->log, 0, 0 );
+						snprintf( c->cr_msg, sizeof( c->cr_msg ),
+							"\"%s <args>\": "
+							"\"obsolete-encoding-workaround\" flag "
+							"incompatible with previously issued \"obsolete-proxy-authz\" flag.",
+							c->argv[0] );
+						Debug( LDAP_DEBUG_ANY, "%s: %s.\n", c->log, c->cr_msg, 0 );
 						err = 1;
 						break;
 
@@ -869,11 +895,22 @@ slap_idassert_parse( ConfigArgs *c, slap_idassert_t *si )
 				} else if ( strcasecmp( flags[ j ], "proxy-authz-non-critical" ) == 0 ) {
 					si->si_flags &= ~LDAP_BACK_AUTH_PROXYAUTHZ_CRITICAL;
 
+				} else if ( strcasecmp( flags[ j ], "dn-none" ) == 0 ) {
+					si->si_flags &= ~LDAP_BACK_AUTH_DN_MASK;
+
+				} else if ( strcasecmp( flags[ j ], "dn-authzid" ) == 0 ) {
+					si->si_flags &= ~LDAP_BACK_AUTH_DN_MASK;
+					si->si_flags |= LDAP_BACK_AUTH_DN_AUTHZID;
+
+				} else if ( strcasecmp( flags[ j ], "dn-whoami" ) == 0 ) {
+					si->si_flags &= ~LDAP_BACK_AUTH_DN_MASK;
+					si->si_flags |= LDAP_BACK_AUTH_DN_WHOAMI;
+
 				} else {
 					snprintf( c->cr_msg, sizeof( c->cr_msg ),
-						"\"idassert-bind <args>\": "
+						"\"%s <args>\": "
 						"unknown flag \"%s\"",
-						flags[ j ] );
+						c->argv[0], flags[ j ] );
 					Debug( LDAP_DEBUG_ANY, "%s: %s.\n", c->log, c->cr_msg, 0 );
 					err = 1;
 					break;
@@ -887,9 +924,9 @@ slap_idassert_parse( ConfigArgs *c, slap_idassert_t *si )
 
 		} else if ( bindconf_parse( c->argv[ i ], &si->si_bc ) ) {
 			snprintf( c->cr_msg, sizeof( c->cr_msg ),
-				"\"idassert-bind <args>\": "
+				"\"%s <args>\": "
 				"unable to parse field \"%s\"",
-				c->argv[ i ] );
+				c->argv[0], c->argv[ i ] );
 			Debug( LDAP_DEBUG_ANY, "%s: %s.\n", c->log, c->cr_msg, 0 );
 			return 1;
 		}
@@ -900,10 +937,18 @@ slap_idassert_parse( ConfigArgs *c, slap_idassert_t *si )
 			|| BER_BVISNULL( &si->si_bc.sb_cred ) )
 		{
 			snprintf( c->cr_msg, sizeof( c->cr_msg ),
-				"\"idassert-bind <args>\": "
-				"SIMPLE needs \"binddn\" and \"credentials\"" );
+				"\"%s <args>\": "
+				"SIMPLE needs \"binddn\" and \"credentials\"", c->argv[0] );
 			Debug( LDAP_DEBUG_ANY, "%s: %s.\n", c->log, c->cr_msg, 0 );
 			return 1;
+		}
+
+	} else if ( si->si_bc.sb_method == LDAP_AUTH_SASL ) {
+		if ( BER_BVISNULL( &si->si_bc.sb_binddn ) &&
+			!(si->si_flags & LDAP_BACK_AUTH_DN_MASK) )
+		{
+			static struct berval authid = BER_BVC("cn=auth");
+			ber_dupbv( &si->si_bc.sb_binddn, &authid );
 		}
 	}
 
@@ -913,22 +958,6 @@ slap_idassert_parse( ConfigArgs *c, slap_idassert_t *si )
 }
 
 /* NOTE: temporary, until back-meta is ported to back-config */
-int
-slap_idassert_authzfrom_parse_cf( const char *fname, int lineno, const char *arg, slap_idassert_t *si )
-{
-	ConfigArgs	c = { 0 };
-	char		*argv[ 3 ];
-
-	snprintf( c.log, sizeof( c.log ), "%s: line %d", fname, lineno );
-	c.argc = 2;
-	c.argv = argv;
-	argv[ 0 ] = "idassert-authzFrom";
-	argv[ 1 ] = (char *)arg;
-	argv[ 2 ] = NULL;
-
-	return slap_idassert_authzfrom_parse( &c, si );
-}
-
 int
 slap_idassert_passthru_parse_cf( const char *fname, int lineno, const char *arg, slap_idassert_t *si )
 {
@@ -943,18 +972,6 @@ slap_idassert_passthru_parse_cf( const char *fname, int lineno, const char *arg,
 	argv[ 2 ] = NULL;
 
 	return slap_idassert_passthru_parse( &c, si );
-}
-
-int
-slap_idassert_parse_cf( const char *fname, int lineno, int argc, char *argv[], slap_idassert_t *si )
-{
-	ConfigArgs	c = { 0 };
-
-	snprintf( c.log, sizeof( c.log ), "%s: line %d", fname, lineno );
-	c.argc = argc;
-	c.argv = argv;
-
-	return slap_idassert_parse( &c, si );
 }
 
 static int
@@ -1143,7 +1160,7 @@ ldap_back_cf_gen( ConfigArgs *c )
 					(void)lutil_strcopy( ptr, "authz=native" );
 				}
 
-				len = bv.bv_len + STRLENOF( "flags=non-prescriptive,override,obsolete-encoding-workaround,proxy-authz-non-critical" );
+				len = bv.bv_len + STRLENOF( "flags=non-prescriptive,override,obsolete-encoding-workaround,proxy-authz-non-critical,dn-authzid" );
 				/* flags */
 				if ( !BER_BVISEMPTY( &bv ) ) {
 					len += STRLENOF( " " );
@@ -1181,6 +1198,22 @@ ldap_back_cf_gen( ConfigArgs *c )
 
 				} else {
 					ptr = lutil_strcopy( ptr, ",proxy-authz-non-critical" );
+				}
+
+				switch ( li->li_idassert_flags & LDAP_BACK_AUTH_DN_MASK ) {
+				case LDAP_BACK_AUTH_DN_AUTHZID:
+					ptr = lutil_strcopy( ptr, ",dn-authzid" );
+					break;
+
+				case LDAP_BACK_AUTH_DN_WHOAMI:
+					ptr = lutil_strcopy( ptr, ",dn-whoami" );
+					break;
+
+				default:
+#if 0 /* implicit */
+					ptr = lutil_strcopy( ptr, ",dn-none" );
+#endif
+					break;
 				}
 
 				bv.bv_len = ( ptr - bv.bv_val );
@@ -1372,6 +1405,25 @@ ldap_back_cf_gen( ConfigArgs *c )
 			c->value_int = LDAP_BACK_NOUNDEFFILTER( li );
 			break;
 
+		case LDAP_BACK_CFG_ONERR:
+			enum_to_verb( onerr_mode, li->li_flags & LDAP_BACK_F_ONERR_STOP, &bv );
+			if ( BER_BVISNULL( &bv )) {
+				rc = 1;
+			} else {
+				value_add_one( &c->rvalue_vals, &bv );
+			}
+			break;
+
+		case LDAP_BACK_CFG_KEEPALIVE: {
+			struct berval bv;
+			char buf[AC_LINE_MAX];
+			bv.bv_len = AC_LINE_MAX;
+			bv.bv_val = &buf[0];
+			slap_keepalive_parse(&bv, &li->li_tls.sb_keepalive, 0, 0, 1);
+			value_add_one( &c->rvalue_vals, &bv );
+			break;
+			}
+
 		default:
 			/* FIXME: we need to handle all... */
 			assert( 0 );
@@ -1533,6 +1585,16 @@ ldap_back_cf_gen( ConfigArgs *c )
 
 		case LDAP_BACK_CFG_NOUNDEFFILTER:
 			li->li_flags &= ~LDAP_BACK_F_NOUNDEFFILTER;
+			break;
+
+		case LDAP_BACK_CFG_ONERR:
+			li->li_flags &= ~LDAP_BACK_F_ONERR_STOP;
+			break;
+
+		case LDAP_BACK_CFG_KEEPALIVE:
+			li->li_tls.sb_keepalive.sk_idle = 0;
+			li->li_tls.sb_keepalive.sk_probes = 0;
+			li->li_tls.sb_keepalive.sk_interval = 0;
 			break;
 
 		default:
@@ -2201,6 +2263,20 @@ done_url:;
 		}
 		break;
 
+	case LDAP_BACK_CFG_ONERR:
+	/* onerr? */
+		i = verb_to_mask( c->argv[1], onerr_mode );
+		if ( BER_BVISNULL( &onerr_mode[i].word ) ) {
+			snprintf( c->cr_msg, sizeof( c->cr_msg ),
+				"%s unknown argument \"%s\"",
+				c->argv[0], c->argv[1] );
+			Debug( LDAP_DEBUG_ANY, "%s: %s.\n", c->log, c->cr_msg, 0 );
+			return 1;
+		}
+		li->li_flags &= ~LDAP_BACK_F_ONERR_STOP;
+		li->li_flags |= onerr_mode[i].mask;
+		break;
+
 	case LDAP_BACK_CFG_REWRITE:
 		snprintf( c->cr_msg, sizeof( c->cr_msg ),
 			"rewrite/remap capabilities have been moved "
@@ -2209,6 +2285,11 @@ done_url:;
 			"and prefix all directives with \"rwm-\")" );
 		Debug( LDAP_DEBUG_ANY, "%s: %s.\n", c->log, c->cr_msg, 0 );
 		return 1;
+
+	case LDAP_BACK_CFG_KEEPALIVE:
+		slap_keepalive_parse( ber_bvstrdup(c->argv[1]),
+				 &li->li_tls.sb_keepalive, 0, 0, 0);
+		break;
 		
 	default:
 		/* FIXME: try to catch inconsistencies */

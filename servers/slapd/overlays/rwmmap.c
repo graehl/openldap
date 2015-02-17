@@ -2,7 +2,7 @@
 /* $OpenLDAP$ */
 /* This work is part of OpenLDAP Software <http://www.openldap.org/>.
  *
- * Copyright 1999-2011 The OpenLDAP Foundation.
+ * Copyright 1999-2015 The OpenLDAP Foundation.
  * Portions Copyright 1999-2003 Howard Chu.
  * Portions Copyright 2000-2003 Pierangelo Masarati.
  * All rights reserved.
@@ -209,13 +209,15 @@ rwm_map_attrnames(
 	}
 
 	assert( i > 0 || x > 0 );
-	*anp = op->o_tmpalloc( ( i + x + 1 )* sizeof( AttributeName ),
+	*anp = op->o_tmpcalloc( ( i + x + 1 ), sizeof( AttributeName ),
 		op->o_tmpmemctx );
 	if ( *anp == NULL ) {
 		return LDAP_NO_MEMORY;
 	}
 
-	for ( i = 0, j = 0; !BER_BVISNULL( &an[i].an_name ); i++ ) {
+	j = 0;
+	if ( an != NULL ) {
+	for ( i = 0; !BER_BVISNULL( &an[i].an_name ); i++ ) {
 		struct ldapmapping	*m;
 		int			at_drop_missing = 0,
 					oc_drop_missing = 0;
@@ -330,6 +332,7 @@ rwm_map_attrnames(
 				continue;
 			}
 		}
+	}
 	}
 
 	if ( op->o_bd->be_extra_anlist != NULL ) {
@@ -462,7 +465,9 @@ map_attr_value(
 				return -1;
 			}
 
-		} else if ( ad->ad_type->sat_equality->smr_usage & SLAP_MR_MUTATION_NORMALIZER ) {
+		} else if ( ad->ad_type->sat_equality &&
+			( ad->ad_type->sat_equality->smr_usage & SLAP_MR_MUTATION_NORMALIZER ) )
+		{
 			if ( ad->ad_type->sat_equality->smr_normalize(
 				(SLAP_MR_DENORMALIZE|SLAP_MR_VALUE_OF_ASSERTION_SYNTAX),
 				NULL, NULL, value, &vtmp, memctx ) )
@@ -541,9 +546,12 @@ rwm_int_filter_map_rewrite(
 		return LDAP_OTHER;
 	}
 
+#if 0
+	/* ITS#6814: give the caller a chance to use undefined filters */
 	if ( f->f_choice & SLAPD_FILTER_UNDEFINED ) {
 		goto computed;
 	}
+#endif
 
 	switch ( f->f_choice & SLAPD_FILTER_MASK ) {
 	case LDAP_FILTER_EQUALITY:

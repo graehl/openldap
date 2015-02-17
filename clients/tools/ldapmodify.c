@@ -1,8 +1,8 @@
 /* ldapmodify.c - generic program to modify or add entries using LDAP */
-/* $OpenLDAP: pkg/ldap/clients/tools/ldapmodify.c,v 1.217 2010/11/23 14:25:49 hallvard Exp $ */
+/* $OpenLDAP$ */
 /* This work is part of OpenLDAP Software <http://www.openldap.org/>.
  *
- * Copyright 1998-2011 The OpenLDAP Foundation.
+ * Copyright 1998-2015 The OpenLDAP Foundation.
  * Portions Copyright 2006 Howard Chu.
  * Portions Copyright 1998-2003 Kurt D. Zeilenga.
  * Portions Copyright 1998-2001 Net Boolean Incorporated.
@@ -73,7 +73,7 @@ static int	ldapadd;
 static char *rejfile = NULL;
 static LDAP	*ld = NULL;
 
-static int process_ldif_rec LDAP_P(( char *rbuf, int lineno ));
+static int process_ldif_rec LDAP_P(( char *rbuf, unsigned long lineno ));
 static int domodify LDAP_P((
 	const struct berval *dn,
 	LDAPMod **pmods,
@@ -187,6 +187,7 @@ handle_private_option( int i )
 				control );
 			usage();
 		}
+		ber_memfree( control );
 		break;
 
 	case 'a':	/* add */
@@ -216,12 +217,12 @@ main( int argc, char **argv )
 {
 	char		*rbuf = NULL, *rejbuf = NULL;
 	FILE		*rejfp;
-	struct LDIFFP *ldiffp, ldifdummy = {0};
+	struct LDIFFP *ldiffp = NULL, ldifdummy = {0};
 	char		*matched_msg, *error_msg;
 	int		rc, retval, ldifrc;
 	int		len;
-	int		i = 0;
-	int		lineno, nextline = 0, lmax = 0;
+	int		i = 0, lmax = 0;
+	unsigned long	lineno, nextline = 0;
 	LDAPControl	c[1];
 
 	prog = lutil_progname( "ldapmodify", argc, argv );
@@ -363,12 +364,6 @@ main( int argc, char **argv )
 	}
 #endif
 
-	if ( !dont && ld != NULL ) {
-		tool_unbind( ld );
-	}
-
-	tool_destroy();
-
 fail:;
 	if ( rejfp != NULL ) {
 		fclose( rejfp );
@@ -378,12 +373,12 @@ fail:;
 		ldif_close( ldiffp );
 	}
 
-	return( retval );
+	tool_exit( ld, retval );
 }
 
 
 static int
-process_ldif_rec( char *rbuf, int linenum )
+process_ldif_rec( char *rbuf, unsigned long linenum )
 {
 	LDIFRecord lr;
 	int lrflags = ldapadd ? LDIF_DEFAULT_ADD : 0;

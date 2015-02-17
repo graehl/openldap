@@ -2,7 +2,7 @@
 /* $OpenLDAP$ */
 /* This work is part of OpenLDAP Software <http://www.openldap.org/>.
  *
- * Copyright 1998-2011 The OpenLDAP Foundation.
+ * Copyright 1998-2015 The OpenLDAP Foundation.
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -934,6 +934,7 @@ static struct slap_schema_ad_map {
     		"DESC 'RFC2307: An integer uniquely identifying a user "
 				"in an administrative domain' "
     		"EQUALITY integerMatch "
+    		"ORDERING integerOrderingMatch "
     		"SYNTAX 1.3.6.1.4.1.1466.115.121.1.27 SINGLE-VALUE )",
 		NULL, 0,
 		NULL, NULL,
@@ -944,6 +945,7 @@ static struct slap_schema_ad_map {
     		"DESC 'RFC2307: An integer uniquely identifying a group "
 				"in an administrative domain' "
     		"EQUALITY integerMatch "
+    		"ORDERING integerOrderingMatch "
     		"SYNTAX 1.3.6.1.4.1.1466.115.121.1.27 SINGLE-VALUE )",
 		NULL, 0,
 		NULL, NULL,
@@ -1159,6 +1161,7 @@ slap_schema_load( void )
 	slap_at_proxied.sat_syntax = slap_schema.si_syn_octetString;
 	slap_schema.si_at_proxied = &slap_at_proxied;
 
+	ldap_pvt_thread_mutex_init( &ad_index_mutex );
 	ldap_pvt_thread_mutex_init( &ad_undef_mutex );
 	ldap_pvt_thread_mutex_init( &oc_undef_mutex );
 

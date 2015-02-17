@@ -1,7 +1,7 @@
 /* $OpenLDAP$ */
 /* This work is part of OpenLDAP Software <http://www.openldap.org/>.
  *
- * Copyright 1999-2011 The OpenLDAP Foundation.
+ * Copyright 1999-2015 The OpenLDAP Foundation.
  * Portions Copyright 2001-2003 Pierangelo Masarati.
  * Portions Copyright 1999-2003 Howard Chu.
  * All rights reserved.
@@ -33,8 +33,6 @@
 #include "slap.h"
 #include "../back-ldap/back-ldap.h"
 #include "back-meta.h"
-#undef ldap_debug	/* silence a warning in ldap-int.h */
-#include "../../../libraries/libldap/ldap-int.h"
 
 #include "lutil_ldap.h"
 
@@ -44,7 +42,8 @@ meta_back_proxy_authz_bind(
 	int			candidate,
 	Operation		*op,
 	SlapReply		*rs,
-	ldap_back_send_t	sendok );
+	ldap_back_send_t	sendok,
+	int			dolock );
 
 static int
 meta_back_single_bind(
@@ -180,7 +179,7 @@ meta_back_bind( Operation *op, SlapReply *rs )
 			}
 
 			
-			(void)meta_back_proxy_authz_bind( mc, i, op, rs, LDAP_BACK_DONTSEND );
+			(void)meta_back_proxy_authz_bind( mc, i, op, rs, LDAP_BACK_DONTSEND, 1 );
 			lerr = rs->sr_err;
 
 		} else {
@@ -307,7 +306,8 @@ meta_back_bind_op_result(
 	metaconn_t		*mc,
 	int			candidate,
 	int			msgid,
-	ldap_back_send_t	sendok )
+	ldap_back_send_t	sendok,
+	int			dolock )
 {
 	metainfo_t		*mi = ( metainfo_t * )op->o_bd->be_private;
 	metatarget_t		*mt = mi->mi_targets[ candidate ];
@@ -386,7 +386,9 @@ retry:;
 			/* don't let anyone else use this handler,
 			 * because there's a pending bind that will not
 			 * be acknowledged */
-			ldap_pvt_thread_mutex_lock( &mi->mi_conninfo.lai_mutex );
+			if ( dolock) {
+				ldap_pvt_thread_mutex_lock( &mi->mi_conninfo.lai_mutex );
+			}
 			assert( LDAP_BACK_CONN_BINDING( msc ) );
 
 #ifdef DEBUG_205
@@ -395,7 +397,9 @@ retry:;
 #endif /* DEBUG_205 */
 
 			meta_clear_one_candidate( op, mc, candidate );
-			ldap_pvt_thread_mutex_unlock( &mi->mi_conninfo.lai_mutex );
+			if ( dolock ) {
+				ldap_pvt_thread_mutex_unlock( &mi->mi_conninfo.lai_mutex );
+			}
 
 			rs->sr_err = timeout_err;
 			rs->sr_text = timeout_text;
@@ -518,7 +522,7 @@ meta_back_single_bind(
 
 	mi->mi_ldap_extra->controls_free( op, rs, &ctrls );
 
-	meta_back_bind_op_result( op, rs, mc, candidate, msgid, LDAP_BACK_DONTSEND );
+	meta_back_bind_op_result( op, rs, mc, candidate, msgid, LDAP_BACK_DONTSEND, 1 );
 	if ( rs->sr_err != LDAP_SUCCESS ) {
 		goto return_results;
 	}
@@ -529,7 +533,7 @@ meta_back_single_bind(
 	 * bind with the configured identity assertion */
 	/* NOTE: use with care */
 	if ( mt->mt_idassert_flags & LDAP_BACK_AUTH_OVERRIDE ) {
-		meta_back_proxy_authz_bind( mc, candidate, op, rs, LDAP_BACK_SENDERR );
+		meta_back_proxy_authz_bind( mc, candidate, op, rs, LDAP_BACK_SENDERR, 1 );
 		if ( !LDAP_BACK_CONN_ISBOUND( msc ) ) {
 			goto return_results;
 		}
@@ -598,7 +602,7 @@ meta_back_single_dobind(
 			( LDAP_BACK_CONN_ISPRIV( mc ) && dn_match( &msc->msc_bound_ndn, &mt->mt_idassert_authcDN ) ) ||
 			( mt->mt_idassert_flags & LDAP_BACK_AUTH_OVERRIDE ) ) )
 	{
-		(void)meta_back_proxy_authz_bind( mc, candidate, op, rs, sendok );
+		(void)meta_back_proxy_authz_bind( mc, candidate, op, rs, sendok, dolock );
 
 	} else {
 		char *binddn = "";
@@ -614,6 +618,10 @@ meta_back_single_dobind(
 
 		/* FIXME: should we check if at least some of the op->o_ctrls
 		 * can/should be passed? */
+		if(!dolock) {
+			ldap_pvt_thread_mutex_unlock( &mi->mi_conninfo.lai_mutex );
+		}
+
 		for (;;) {
 			rs->sr_err = ldap_sasl_bind( msc->msc_ld,
 				binddn, LDAP_SASL_SIMPLE, &cred,
@@ -624,7 +632,11 @@ meta_back_single_dobind(
 			ldap_pvt_thread_yield();
 		}
 
-		rs->sr_err = meta_back_bind_op_result( op, rs, mc, candidate, msgid, sendok );
+		if(!dolock) {
+			ldap_pvt_thread_mutex_lock( &mi->mi_conninfo.lai_mutex );
+		}
+
+		rs->sr_err = meta_back_bind_op_result( op, rs, mc, candidate, msgid, sendok, dolock );
 
 		/* if bind succeeded, but anonymous, clear msc_bound_ndn */
 		if ( rs->sr_err != LDAP_SUCCESS || binddn[0] == '\0' ) {
@@ -1336,6 +1348,7 @@ meta_back_proxy_authz_cred(
 	} else {
 		ndn = op->o_ndn;
 	}
+	rs->sr_err = LDAP_SUCCESS;
 
 	/*
 	 * FIXME: we need to let clients use proxyAuthz
@@ -1550,7 +1563,13 @@ done:;
 }
 
 static int
-meta_back_proxy_authz_bind( metaconn_t *mc, int candidate, Operation *op, SlapReply *rs, ldap_back_send_t sendok )
+meta_back_proxy_authz_bind(
+	metaconn_t *mc,
+	int candidate,
+	Operation *op,
+	SlapReply *rs,
+	ldap_back_send_t sendok,
+	int dolock )
 {
 	metainfo_t		*mi = (metainfo_t *)op->o_bd->be_private;
 	metatarget_t		*mt = mi->mi_targets[ candidate ];
@@ -1567,6 +1586,11 @@ meta_back_proxy_authz_bind( metaconn_t *mc, int candidate, Operation *op, SlapRe
 		switch ( method ) {
 		case LDAP_AUTH_NONE:
 		case LDAP_AUTH_SIMPLE:
+
+			if(!dolock) {
+				ldap_pvt_thread_mutex_unlock( &mi->mi_conninfo.lai_mutex );
+			}
+
 			for (;;) {
 				rs->sr_err = ldap_sasl_bind( msc->msc_ld,
 					binddn.bv_val, LDAP_SASL_SIMPLE,
@@ -1576,7 +1600,12 @@ meta_back_proxy_authz_bind( metaconn_t *mc, int candidate, Operation *op, SlapRe
 				}
 				ldap_pvt_thread_yield();
 			}
-			rc = meta_back_bind_op_result( op, rs, mc, candidate, msgid, sendok );
+
+			if(!dolock) {
+				ldap_pvt_thread_mutex_lock( &mi->mi_conninfo.lai_mutex );
+			}
+
+			rc = meta_back_bind_op_result( op, rs, mc, candidate, msgid, sendok, dolock );
 			if ( rc == LDAP_SUCCESS ) {
 				/* set rebind stuff in case of successful proxyAuthz bind,
 				 * so that referral chasing is attempted using the right

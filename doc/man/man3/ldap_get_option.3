@@ -1,6 +1,6 @@
 .TH LDAP_GET_OPTION 3 "RELEASEDATE" "OpenLDAP LDVERSION"
 .\" $OpenLDAP$
-.\" Copyright 1998-2011 The OpenLDAP Foundation All Rights Reserved.
+.\" Copyright 1998-2015 The OpenLDAP Foundation All Rights Reserved.
 .\" Copying restrictions apply.  See COPYRIGHT/LICENSE.
 .SH NAME
 ldap_get_option, ldap_set_option \- LDAP option handling routines
@@ -27,7 +27,9 @@ is cast to
 The actual type is determined based on the value of the
 .B option
 argument.
-Global options are set/retrieved by passing a NULL LDAP handle.
+Global options are set/retrieved by passing a NULL LDAP handle. LDAP handles
+inherit their default settings from the global options in effect at the time
+the handle is created.
 .TP
 .B LDAP_OPT_API_FEATURE_INFO
 Fills-in a 
@@ -36,6 +38,13 @@ Fills-in a
 must be a 
 .BR "LDAPAPIFeatureInfo *" ,
 pointing to an already allocated struct.
+The
+.B ldapaif_info_version
+field of the struct must be initialized to
+.B LDAP_FEATURE_INFO_VERSION
+before making the call. The
+.B ldapaif_name
+field must be set to the name of a feature to query.
 This is a read-only option.
 .TP
 .B LDAP_OPT_API_INFO
@@ -44,7 +53,20 @@ Fills-in a
 .BR outvalue 
 must be a 
 .BR "LDAPAPIInfo *" ,
-pointing to an already allocated struct.
+pointing to an already allocated struct. The
+.B ldapai_info_version
+field of the struct must be initialized to
+.B LDAP_API_INFO_VERSION
+before making the call.
+If the version passed in does not match the current library
+version, the expected version number will be stored in the
+struct and the call will fail.
+The caller is responsible for freeing the elements of the
+.B ldapai_extensions
+array and the array itself using
+.BR ldap_memfree (3).
+The caller must also free the
+.BR ldapi_vendor_name .
 This is a read-only option.
 .TP
 .B LDAP_OPT_CLIENT_CONTROLS
@@ -451,7 +473,7 @@ must be
 .BR "char ***" .
 The caller must not free or otherwise muck with it.
 .TP
-.B LDAP_OPT_X_SASL_NOCANON	
+.B LDAP_OPT_X_SASL_NOCANON
 Sets/gets the NOCANON flag.
 When unset, the hostname is canonicalized.
 .BR invalue
@@ -606,6 +628,14 @@ must be
 and its contents need to be freed by the caller using
 .BR ldap_memfree (3).
 .TP
+.B LDAP_OPT_X_TLS_CIPHER
+Gets the cipher being used on an established TLS session.
+.BR outvalue
+must be
+.BR "char **" ,
+and its contents need to be freed by the caller using
+.BR ldap_memfree (3).
+.TP
 .B LDAP_OPT_X_TLS_CIPHER_SUITE
 Sets/gets the allowed cipher suite.
 .BR invalue
@@ -686,7 +716,21 @@ must be
 .BR "char **" ,
 and its contents need to be freed by the caller using
 .BR ldap_memfree (3).
-Ignored by GnuTLS.
+Ignored by Mozilla NSS.
+.TP
+.B LDAP_OPT_X_TLS_ECNAME
+Gets/sets the name of the curve used for 
+elliptic curve key exchanges.
+.BR invalue
+must be
+.BR "const char *" ;
+.BR outvalue
+must be
+.BR "char **" ,
+and its contents need to be freed by the caller using
+.BR ldap_memfree (3).
+Ignored by GnuTLS and Mozilla NSS. In GnuTLS a curve may be selected
+in the cipher suite specification.
 .TP
 .B LDAP_OPT_X_TLS_KEYFILE
 Sets/gets the full-path of the certificate key file.
@@ -707,6 +751,14 @@ must be
 A non-zero value pointed to by
 .BR invalue
 tells the library to create a context for a server.
+.TP
+.B LDAP_OPT_X_TLS_PEERCERT
+Gets the peer's certificate in DER format from an established TLS session.
+.BR outvalue
+must be
+.BR "struct berval *" ,
+and the data it returns needs to be freed by the caller using
+.BR ldap_memfree (3).
 .TP
 .B LDAP_OPT_X_TLS_PROTOCOL_MIN
 Sets/gets the minimum protocol version.
@@ -731,7 +783,7 @@ must be
 .BR "char **" ,
 and its contents need to be freed by the caller using
 .BR ldap_memfree (3).
-Ignored by GnuTLS older than version 2.2.
+Ignored by GnuTLS older than version 2.2.  Ignored by Mozilla NSS.
 .TP
 .B LDAP_OPT_X_TLS_REQUIRE_CERT
 Sets/gets the peer certificate checking strategy,
@@ -750,6 +802,14 @@ must be
 When using the OpenSSL library this is an SSL*. When using other
 crypto libraries this is a pointer to an OpenLDAP private structure.
 Applications generally should not use this option.
+.TP
+.B LDAP_OPT_X_TLS_VERSION
+Gets the TLS version being used on an established TLS session.
+.BR outvalue
+must be
+.BR "char **" ,
+and its contents need to be freed by the caller using
+.BR ldap_memfree (3).
 .SH ERRORS
 On success, the functions return
 .BR LDAP_OPT_SUCCESS ,

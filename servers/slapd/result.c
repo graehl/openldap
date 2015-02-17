@@ -2,7 +2,7 @@
 /* $OpenLDAP$ */
 /* This work is part of OpenLDAP Software <http://www.openldap.org/>.
  *
- * Copyright 1998-2011 The OpenLDAP Foundation.
+ * Copyright 1998-2015 The OpenLDAP Foundation.
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -132,8 +132,54 @@ slap_req2res( ber_tag_t tag )
 	return tag;
 }
 
-/* SlapReply debugging, prodo-slap.h overrides it in OpenLDAP releases */
+/*
+ * SlapReply debugging enabled by USE_RS_ASSERT.
+ *
+ * Disabled by default, but compiled in (but still unused) when
+ * LDAP_TEST.  #define USE_RS_ASSERT as nonzero to enable some
+ * assertions which check the SlapReply.  USE_RS_ASSERT = 2 or higher
+ * check aggressively, currently some code fail these tests.
+ *
+ * Environment variable $NO_RS_ASSERT controls how USE_RS_ASSERT handles
+ * errors.  > 0: ignore errors, 0: abort (the default), < 0: just warn.
+ *
+ * Wrap LDAP operation calls in macros SLAP_OP() & co from proto-slap.h
+ * to check the SlapReply.  contrib/slapd-tools/wrap_slap_ops converts
+ * source code to use the macros.
+ */
 #if defined(LDAP_TEST) || (defined(USE_RS_ASSERT) && (USE_RS_ASSERT))
+
+int rs_suppress_assert = 0;
+
+/* RS_ASSERT() helper function */
+void rs_assert_(const char*file, unsigned line, const char*fn, const char*cond)
+{
+	int no_assert = rs_suppress_assert, save_errno = errno;
+	const char *s;
+
+	if ( no_assert >= 0 ) {
+		if ( no_assert == 0 && (s = getenv( "NO_RS_ASSERT" )) && *s ) {
+			no_assert = rs_suppress_assert = atoi( s );
+		}
+		if ( no_assert > 0 ) {
+			errno = save_errno;
+			return;
+		}
+	}
+
+#ifdef rs_assert_	/* proto-slap.h #defined away the fn parameter */
+	fprintf( stderr,"%s:%u: "  "RS_ASSERT(%s) failed.\n", file,line,cond );
+#else
+	fprintf( stderr,"%s:%u: %s: RS_ASSERT(%s) failed.\n", file,line,fn,cond );
+#endif
+	fflush( stderr );
+
+	errno = save_errno;
+	/* $NO_RS_ASSERT > 0: ignore rs_asserts, 0: abort, < 0: just warn */
+	if ( !no_assert /* from $NO_RS_ASSERT */ ) abort();
+}
+
+/* SlapReply is consistent */
 void
 (rs_assert_ok)( const SlapReply *rs )
 {
@@ -161,6 +207,8 @@ void
 #endif
 #endif
 }
+
+/* Ready for calling a new backend operation */
 void
 (rs_assert_ready)( const SlapReply *rs )
 {
@@ -178,6 +226,8 @@ void
 	RS_ASSERT( !(rs->sr_flags & REP_ENTRY_MASK) );
 #endif
 }
+
+/* Backend operation done */
 void
 (rs_assert_done)( const SlapReply *rs )
 {
@@ -188,6 +238,7 @@ void
 	RS_ASSERT( !(rs->sr_flags & REP_ENTRY_MUSTFLUSH) );
 #endif
 }
+
 #endif /* LDAP_TEST || USE_RS_ASSERT */
 
 /* Reset a used SlapReply whose contents has been flushed (freed/released) */
@@ -231,7 +282,7 @@ rs_replace_entry( Operation *op, SlapReply *rs, slap_overinst *on, Entry *e )
  * Return nonzero if rs->sr_entry was replaced.
  */
 int
-rs_ensure_entry_modifiable( Operation *op, SlapReply *rs, slap_overinst *on )
+rs_entry2modifiable( Operation *op, SlapReply *rs, slap_overinst *on )
 {
 	if ( rs->sr_flags & REP_ENTRY_MODIFIABLE ) {
 		rs_assert_ok( rs );
@@ -242,6 +293,22 @@ rs_ensure_entry_modifiable( Operation *op, SlapReply *rs, slap_overinst *on )
 	return 1;
 }
 
+/* Check for any callbacks that want to be informed about being blocked
+ * on output. These callbacks are expected to leave the callback list
+ * unmodified. Their result is ignored.
+ */
+static void
+slap_writewait_play(
+	Operation *op )
+{
+	slap_callback	*sc = op->o_callback;
+
+	for ( ; sc; sc = sc->sc_next ) {
+		if ( sc->sc_writewait )
+			sc->sc_writewait( op, sc );
+	}
+}
+
 static long send_ldap_ber(
 	Operation *op,
 	BerElement *ber )
@@ -249,6 +316,7 @@ static long send_ldap_ber(
 	Connection *conn = op->o_conn;
 	ber_len_t bytes;
 	long ret = 0;
+	char *close_reason;
 
 	ber_get_option( ber, LBER_OPT_BER_BYTES_TO_WRITE, &bytes );
 
@@ -263,7 +331,9 @@ static long send_ldap_ber(
 	conn->c_writers++;
 
 	while ( conn->c_writers > 0 && conn->c_writing ) {
+		ldap_pvt_thread_pool_idle( &connection_pool );
 		ldap_pvt_thread_cond_wait( &conn->c_write1_cv, &conn->c_write1_mutex );
+		ldap_pvt_thread_pool_unidle( &connection_pool );
 	}
 
 	/* connection was closed under us */
@@ -283,23 +353,7 @@ static long send_ldap_ber(
 	while( 1 ) {
 		int err;
 
-		/* lock the connection */ 
-		if ( ldap_pvt_thread_mutex_trylock( &conn->c_mutex )) {
-			if ( !connection_valid(conn)) {
-				ret = 0;
-				break;
-			}
-			ldap_pvt_thread_mutex_unlock( &conn->c_write1_mutex );
-			ldap_pvt_thread_mutex_lock( &conn->c_write1_mutex );
-			if ( conn->c_writers < 0 ) {
-				ret = 0;
-				break;
-			}
-			continue;
-		}
-
 		if ( ber_flush2( conn->c_sb, ber, LBER_FLUSH_FREE_NEVER ) == 0 ) {
-			ldap_pvt_thread_mutex_unlock( &conn->c_mutex );
 			ret = bytes;
 			break;
 		}
@@ -316,26 +370,37 @@ static long send_ldap_ber(
 		    err, sock_errstr(err), 0 );
 
 		if ( err != EWOULDBLOCK && err != EAGAIN ) {
+			close_reason = "connection lost on write";
+fail:
 			conn->c_writers--;
 			conn->c_writing = 0;
 			ldap_pvt_thread_mutex_unlock( &conn->c_write1_mutex );
-			connection_closing( conn, "connection lost on write" );
-
+			ldap_pvt_thread_mutex_lock( &conn->c_mutex );
+			connection_closing( conn, close_reason );
 			ldap_pvt_thread_mutex_unlock( &conn->c_mutex );
 			return -1;
 		}
 
 		/* wait for socket to be write-ready */
-		ldap_pvt_thread_mutex_lock( &conn->c_write2_mutex );
 		conn->c_writewaiter = 1;
-		slapd_set_write( conn->c_sd, 2 );
-
 		ldap_pvt_thread_mutex_unlock( &conn->c_write1_mutex );
-		ldap_pvt_thread_mutex_unlock( &conn->c_mutex );
-		ldap_pvt_thread_cond_wait( &conn->c_write2_cv, &conn->c_write2_mutex );
+		ldap_pvt_thread_pool_idle( &connection_pool );
+		slap_writewait_play( op );
+		err = slapd_wait_writer( conn->c_sd );
 		conn->c_writewaiter = 0;
-		ldap_pvt_thread_mutex_unlock( &conn->c_write2_mutex );
+		ldap_pvt_thread_pool_unidle( &connection_pool );
 		ldap_pvt_thread_mutex_lock( &conn->c_write1_mutex );
+		/* 0 is timeout, so we close it.
+		 * -1 is an error, close it.
+		 */
+		if ( err <= 0 ) {
+			if ( err == 0 )
+				close_reason = "writetimeout";
+			else
+				close_reason = "connection lost on writewait";
+			goto fail;
+		}
+
 		if ( conn->c_writers < 0 ) {
 			ret = 0;
 			break;
@@ -533,7 +598,8 @@ send_ldap_response(
 	int		rc = LDAP_SUCCESS;
 	long	bytes;
 
-	if (( rs->sr_err == SLAPD_ABANDON || op->o_abandon ) && !op->o_cancel ) {
+	/* op was actually aborted, bypass everything if client didn't Cancel */
+	if (( rs->sr_err == SLAPD_ABANDON ) && !op->o_cancel ) {
 		rc = SLAPD_ABANDON;
 		goto clean2;
 	}
@@ -543,6 +609,12 @@ send_ldap_response(
 		if ( rc != SLAP_CB_CONTINUE ) {
 			goto clean2;
 		}
+	}
+
+	/* op completed, connection aborted, bypass sending response */
+	if ( op->o_abandon && !op->o_cancel ) {
+		rc = SLAPD_ABANDON;
+		goto clean2;
 	}
 
 #ifdef LDAP_CONNECTIONLESS
@@ -899,6 +971,9 @@ slap_send_ldap_intermediate( Operation *op, SlapReply *rs )
 	}
 }
 
+#define set_ldap_error( rs, err, text ) do { \
+		(rs)->sr_err = err; (rs)->sr_text = text; } while(0)
+
 /*
  * returns:
  *
@@ -927,18 +1002,20 @@ slap_send_search_entry( Operation *op, SlapReply *rs )
 	 */
 	char **e_flags = NULL;
 
+	rs->sr_type = REP_SEARCH;
+
 	if ( op->ors_slimit >= 0 && rs->sr_nentries >= op->ors_slimit ) {
-		return LDAP_SIZELIMIT_EXCEEDED;
+		rc = LDAP_SIZELIMIT_EXCEEDED;
+		goto error_return;
 	}
 
 	/* Every 64 entries, check for thread pool pause */
 	if ( ( ( rs->sr_nentries & 0x3f ) == 0x3f ) &&
 		ldap_pvt_thread_pool_pausing( &connection_pool ) > 0 )
 	{
-		return LDAP_BUSY;
+		rc = LDAP_BUSY;
+		goto error_return;
 	}
-
-	rs->sr_type = REP_SEARCH;
 
 	/* eventually will loop through generated operational attribute types
 	 * currently implemented types include:
@@ -1005,7 +1082,8 @@ slap_send_search_entry( Operation *op, SlapReply *rs )
 #endif
 	if ( op->o_res_ber ) {
 		/* read back control */
-	    rc = ber_printf( ber, "{O{" /*}}*/, &rs->sr_entry->e_name );
+	    rc = ber_printf( ber, "t{O{" /*}}*/,
+			LDAP_RES_SEARCH_ENTRY, &rs->sr_entry->e_name );
 	} else {
 	    rc = ber_printf( ber, "{it{O{" /*}}}*/, op->o_msgid,
 			LDAP_RES_SEARCH_ENTRY, &rs->sr_entry->e_name );
@@ -1017,7 +1095,7 @@ slap_send_search_entry( Operation *op, SlapReply *rs )
 			op->o_connid, 0, 0 );
 
 		if ( op->o_res_ber == NULL ) ber_free_buf( ber );
-		send_ldap_error( op, rs, LDAP_OTHER, "encoding DN error" );
+		set_ldap_error( rs, LDAP_OTHER, "encoding DN error" );
 		rc = rs->sr_err;
 		goto error_return;
 	}
@@ -1047,7 +1125,7 @@ slap_send_search_entry( Operation *op, SlapReply *rs )
 					op->o_connid, 0, 0 );
 				ber_free( ber, 1 );
 	
-				send_ldap_error( op, rs, LDAP_OTHER, "out of memory" );
+				set_ldap_error( rs, LDAP_OTHER, "out of memory" );
 				goto error_return;
 			}
 			a_flags = (char *)(e_flags + i);
@@ -1064,7 +1142,7 @@ slap_send_search_entry( Operation *op, SlapReply *rs )
 					"conn %lu matched values filtering failed\n",
 					op->o_connid, 0, 0 );
 				if ( op->o_res_ber == NULL ) ber_free_buf( ber );
-				send_ldap_error( op, rs, LDAP_OTHER,
+				set_ldap_error( rs, LDAP_OTHER,
 					"matched values filtering error" );
 				rc = rs->sr_err;
 				goto error_return;
@@ -1118,7 +1196,7 @@ slap_send_search_entry( Operation *op, SlapReply *rs )
 					op->o_connid, 0, 0 );
 
 				if ( op->o_res_ber == NULL ) ber_free_buf( ber );
-				send_ldap_error( op, rs, LDAP_OTHER,
+				set_ldap_error( rs, LDAP_OTHER,
 					"encoding description error");
 				rc = rs->sr_err;
 				goto error_return;
@@ -1152,7 +1230,7 @@ slap_send_search_entry( Operation *op, SlapReply *rs )
 							op->o_connid, 0, 0 );
 
 						if ( op->o_res_ber == NULL ) ber_free_buf( ber );
-						send_ldap_error( op, rs, LDAP_OTHER,
+						set_ldap_error( rs, LDAP_OTHER,
 							"encoding description error");
 						rc = rs->sr_err;
 						goto error_return;
@@ -1164,7 +1242,7 @@ slap_send_search_entry( Operation *op, SlapReply *rs )
 						"ber_printf failed.\n", op->o_connid, 0, 0 );
 
 					if ( op->o_res_ber == NULL ) ber_free_buf( ber );
-					send_ldap_error( op, rs, LDAP_OTHER,
+					set_ldap_error( rs, LDAP_OTHER,
 						"encoding values error" );
 					rc = rs->sr_err;
 					goto error_return;
@@ -1178,7 +1256,7 @@ slap_send_search_entry( Operation *op, SlapReply *rs )
 				op->o_connid, 0, 0 );
 
 			if ( op->o_res_ber == NULL ) ber_free_buf( ber );
-			send_ldap_error( op, rs, LDAP_OTHER, "encode end error" );
+			set_ldap_error( rs, LDAP_OTHER, "encode end error" );
 			rc = rs->sr_err;
 			goto error_return;
 		}
@@ -1211,7 +1289,7 @@ slap_send_search_entry( Operation *op, SlapReply *rs )
 					"for matched values filtering\n",
 					op->o_connid, 0, 0 );
 				if ( op->o_res_ber == NULL ) ber_free_buf( ber );
-				send_ldap_error( op, rs, LDAP_OTHER,
+				set_ldap_error( rs, LDAP_OTHER,
 					"not enough memory for matched values filtering" );
 				goto error_return;
 			}
@@ -1231,7 +1309,7 @@ slap_send_search_entry( Operation *op, SlapReply *rs )
 					"matched values filtering failed\n", 
 					op->o_connid, 0, 0);
 				if ( op->o_res_ber == NULL ) ber_free_buf( ber );
-				send_ldap_error( op, rs, LDAP_OTHER,
+				set_ldap_error( rs, LDAP_OTHER,
 					"matched values filtering error" );
 				rc = rs->sr_err;
 				goto error_return;
@@ -1256,6 +1334,10 @@ slap_send_search_entry( Operation *op, SlapReply *rs )
 				{
 					continue;
 				}
+				/* if DSA-specific and replicating, skip */
+				if ( op->o_sync != SLAP_CONTROL_NONE &&
+					desc->ad_type->sat_usage == LDAP_SCHEMA_DSA_OPERATION )
+					continue;
 			} else {
 				if ( !userattrs && !ad_inlist( desc, rs->sr_attrs ) ) {
 					continue;
@@ -1281,7 +1363,7 @@ slap_send_search_entry( Operation *op, SlapReply *rs )
 				"ber_printf failed\n", op->o_connid, 0, 0 );
 
 			if ( op->o_res_ber == NULL ) ber_free_buf( ber );
-			send_ldap_error( op, rs, LDAP_OTHER,
+			set_ldap_error( rs, LDAP_OTHER,
 				"encoding description error" );
 			rc = rs->sr_err;
 			goto error_return;
@@ -1310,7 +1392,7 @@ slap_send_search_entry( Operation *op, SlapReply *rs )
 						op->o_connid, 0, 0 );
 
 					if ( op->o_res_ber == NULL ) ber_free_buf( ber );
-					send_ldap_error( op, rs, LDAP_OTHER,
+					set_ldap_error( rs, LDAP_OTHER,
 						"encoding values error" );
 					rc = rs->sr_err;
 					goto error_return;
@@ -1324,7 +1406,7 @@ slap_send_search_entry( Operation *op, SlapReply *rs )
 				op->o_connid, 0, 0 );
 
 			if ( op->o_res_ber == NULL ) ber_free_buf( ber );
-			send_ldap_error( op, rs, LDAP_OTHER, "encode end error" );
+			set_ldap_error( rs, LDAP_OTHER, "encode end error" );
 			rc = rs->sr_err;
 			goto error_return;
 		}
@@ -1359,7 +1441,7 @@ slap_send_search_entry( Operation *op, SlapReply *rs )
 		Debug( LDAP_DEBUG_ANY, "ber_printf failed\n", 0, 0, 0 );
 
 		if ( op->o_res_ber == NULL ) ber_free_buf( ber );
-		send_ldap_error( op, rs, LDAP_OTHER, "encode entry end error" );
+		set_ldap_error( rs, LDAP_OTHER, "encode entry end error" );
 		rc = rs->sr_err;
 		goto error_return;
 	}
@@ -1411,16 +1493,6 @@ error_return:;
 	}
 	rs->sr_attr_flags = SLAP_ATTRS_UNDEFINED;
 
-	/* FIXME: I think rs->sr_type should be explicitly set to
-	 * REP_SEARCH here. That's what it was when we entered this
-	 * function. send_ldap_error may have changed it, but we
-	 * should set it back so that the cleanup functions know
-	 * what they're doing.
-	 *
-	 * ...No, that's what we set it to on entering this function.
-	 * And we may have to clear out rs->sr_un.sru_search first,
-	 * if it can contain data from sr_un.sru_extended.
-	 */
 	if ( op->o_tag == LDAP_REQ_SEARCH && rs->sr_type == REP_SEARCH ) {
 		rs_flush_entry( op, rs, NULL );
 	} else {
@@ -1538,7 +1610,7 @@ slap_send_search_reference( Operation *op, SlapReply *rs )
 		if (!op->o_conn || op->o_conn->c_is_udp == 0)
 #endif
 		ber_free_buf( ber );
-		send_ldap_error( op, rs, LDAP_OTHER, "encode DN error" );
+		set_ldap_error( rs, LDAP_OTHER, "encode DN error" );
 		goto rel;
 	}
 
@@ -1579,7 +1651,11 @@ slap_send_search_reference( Operation *op, SlapReply *rs )
 
 	Debug( LDAP_DEBUG_TRACE, "<= send_search_reference\n", 0, 0, 0 );
 
+	if ( 0 ) {
 rel:
+	    rs_flush_entry( op, rs, NULL );
+	}
+
 	if ( op->o_callback ) {
 		(void)slap_cleanup_play( op, rs );
 	}
@@ -1653,15 +1729,16 @@ str2result(
 				continue;
 			}
 
-			while ( isspace( (unsigned char) next[ 0 ] ) ) next++;
-			if ( next[ 0 ] != '\0' ) {
+			while ( isspace( (unsigned char) next[ 0 ] ) && next[ 0 ] != '\n' )
+				next++;
+			if ( next[ 0 ] != '\0' && next[ 0 ] != '\n' ) {
 				Debug( LDAP_DEBUG_ANY, "str2result (%s) extra cruft after value\n",
 				    s, 0, 0 );
 				rc = -1;
 				continue;
 			}
 
-			/* FIXME: what if it's larger that max int? */
+			/* FIXME: what if it's larger than max int? */
 			*code = (int)retcode;
 
 		} else if ( strncasecmp( s, "matched", STRLENOF( "matched" ) ) == 0 ) {
@@ -1717,6 +1794,7 @@ int slap_read_controls(
 	myop.o_res_ber = ber;
 	myop.o_callback = NULL;
 	myop.ors_slimit = 1;
+	myop.ors_attrsonly = 0;
 
 	rc = slap_send_search_entry( &myop, rs );
 	if( rc ) return rc;

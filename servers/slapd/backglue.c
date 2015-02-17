@@ -2,7 +2,7 @@
 /* $OpenLDAP$ */
 /* This work is part of OpenLDAP Software <http://www.openldap.org/>.
  *
- * Copyright 2001-2011 The OpenLDAP Foundation.
+ * Copyright 2001-2015 The OpenLDAP Foundation.
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -225,8 +225,7 @@ glue_op_func ( Operation *op, SlapReply *rs )
 {
 	slap_overinst	*on = (slap_overinst *)op->o_bd->bd_info;
 	BackendDB *b0 = op->o_bd;
-	BackendInfo *bi0 = op->o_bd->bd_info;
-	BI_op_modify **func;
+	BackendInfo *bi0 = op->o_bd->bd_info, *bi1;
 	slap_operation_t which = op_bind;
 	int rc;
 
@@ -247,15 +246,37 @@ glue_op_func ( Operation *op, SlapReply *rs )
 	default: assert( 0 ); break;
 	}
 
-	func = &op->o_bd->bd_info->bi_op_bind;
-	if ( func[which] )
-		rc = func[which]( op, rs );
-	else
-		rc = SLAP_CB_BYPASS;
+	bi1 = op->o_bd->bd_info;
+	rc = (&bi1->bi_op_bind)[ which ] ?
+		(&bi1->bi_op_bind)[ which ]( op, rs ) : SLAP_CB_BYPASS;
 
 	op->o_bd = b0;
 	op->o_bd->bd_info = bi0;
 	return rc;
+}
+
+static int
+glue_op_abandon( Operation *op, SlapReply *rs )
+{
+	slap_overinst	*on = (slap_overinst *)op->o_bd->bd_info;
+	glueinfo		*gi = (glueinfo *)on->on_bi.bi_private;
+	BackendDB *b0 = op->o_bd;
+	BackendInfo *bi0 = op->o_bd->bd_info;
+	int i;
+
+	b0->bd_info = on->on_info->oi_orig;
+
+	for (i = gi->gi_nodes-1; i >= 0; i--) {
+		assert( gi->gi_n[i].gn_be->be_nsuffix != NULL );
+		op->o_bd = gi->gi_n[i].gn_be;
+		if ( op->o_bd == b0 )
+			continue;
+		if ( op->o_bd->bd_info->bi_op_abandon )
+			op->o_bd->bd_info->bi_op_abandon( op, rs );
+	}
+	op->o_bd = b0;
+	op->o_bd->bd_info = bi0;
+	return SLAP_CB_CONTINUE;
 }
 
 static int
@@ -1510,6 +1531,7 @@ glue_sub_init()
 	glue.on_bi.bi_op_modrdn = glue_op_func;
 	glue.on_bi.bi_op_add = glue_op_func;
 	glue.on_bi.bi_op_delete = glue_op_func;
+	glue.on_bi.bi_op_abandon = glue_op_abandon;
 	glue.on_bi.bi_extended = glue_op_func;
 
 	glue.on_bi.bi_chk_referrals = glue_chk_referrals;

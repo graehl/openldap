@@ -2,7 +2,7 @@
 /* $OpenLDAP$ */
 /* This work is part of OpenLDAP Software <http://www.openldap.org/>.
  *
- * Copyright 2001-2011 The OpenLDAP Foundation.
+ * Copyright 2001-2015 The OpenLDAP Foundation.
  * Portions Copyright 2001-2003 Pierangelo Masarati.
  * All rights reserved.
  *
@@ -39,9 +39,8 @@ monitor_find_children(
 	Entry **vol
 )
 {
-	monitor_info_t	*mi = ( monitor_info_t * )op->o_bd->be_private;
 	monitor_entry_t *mp;
-	
+
 	mp = ( monitor_entry_t * )e_parent->e_private;
 	*nonv = mp->mp_children;
 

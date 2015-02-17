@@ -2,7 +2,7 @@
 /* $OpenLDAP$ */
 /* This work is part of OpenLDAP Software <http://www.openldap.org/>.
  *
- * Copyright 2009-2011 The OpenLDAP Foundation.
+ * Copyright 2009-2015 The OpenLDAP Foundation.
  * Portions copyright 2009 Symas Corporation.
  * All rights reserved.
  *
@@ -342,6 +342,23 @@ static int pack_sss_response_control(
 }
 
 /* Return the session id or -1 if unknown */
+static int find_session_by_so(
+	int svi_max_percon,
+	int conn_id,
+	sort_op *so )
+{
+	int sess_id;
+	if (so == NULL) {
+		return -1;
+	}
+	for (sess_id = 0; sess_id < svi_max_percon; sess_id++) {
+		if ( sort_conns[conn_id] && sort_conns[conn_id][sess_id] == so )
+			return sess_id;
+	}
+	return -1;
+}
+
+/* Return the session id or -1 if unknown */
 static int find_session_by_context(
 	int svi_max_percon,
 	int conn_id,
@@ -379,14 +396,25 @@ static int find_next_session(
 static void free_sort_op( Connection *conn, sort_op *so )
 {
 	int sess_id;
-	PagedResultsCookie ps_cookie = (PagedResultsCookie) so->so_tree;
 	if ( so->so_tree ) {
-		tavl_free( so->so_tree, ch_free );
+		if ( so->so_paged > SLAP_CONTROL_IGNORED ) {
+			Avlnode *cur_node, *next_node;
+			cur_node = so->so_tree;
+			while ( cur_node ) {
+				next_node = tavl_next( cur_node, TAVL_DIR_RIGHT );
+				ch_free( cur_node->avl_data );
+				ber_memfree( cur_node );
+
+				cur_node = next_node;
+			}
+		} else {
+			tavl_free( so->so_tree, ch_free );
+		}
 		so->so_tree = NULL;
 	}
 
 	ldap_pvt_thread_mutex_lock( &sort_conns_mutex );
-	sess_id = find_session_by_context( so->so_info->svi_max_percon, conn->c_conn_idx, so->so_vcontext, ps_cookie );
+	sess_id = find_session_by_so( so->so_info->svi_max_percon, conn->c_conn_idx, so );
 	sort_conns[conn->c_conn_idx][sess_id] = NULL;
 	so->so_info->svi_num--;
 	ldap_pvt_thread_mutex_unlock( &sort_conns_mutex );
@@ -419,6 +447,8 @@ static void send_list(
 	BackendDB *be;
 	Entry *e;
 	LDAPControl *ctrls[2];
+
+	rs->sr_attrs = op->ors_attrs;
 
 	/* FIXME: it may be better to just flatten the tree into
 	 * an array before doing all of this...
@@ -492,15 +522,17 @@ range_err:
 			sc->sc_nkeys * sizeof(struct berval), op->o_tmpmemctx );
 		sn->sn_vals = (struct berval *)(sn+1);
 		sn->sn_conn = op->o_conn->c_conn_idx;
-		sn->sn_session = find_session_by_context( so->so_info->svi_max_percon, op->o_conn->c_conn_idx, vc->vc_context, NO_PS_COOKIE );
+		sn->sn_session = find_session_by_so( so->so_info->svi_max_percon, op->o_conn->c_conn_idx, so );
 		sn->sn_vals[0] = bv;
 		for (i=1; i<sc->sc_nkeys; i++) {
 			BER_BVZERO( &sn->sn_vals[i] );
 		}
 		cur_node = tavl_find3( so->so_tree, sn, node_cmp, &j );
 		/* didn't find >= match */
-		if ( j > 0 )
-			cur_node = NULL;
+		if ( j > 0 ) {
+			if ( cur_node )
+				cur_node = tavl_next( cur_node, TAVL_DIR_RIGHT );
+		}
 		op->o_tmpfree( sn, op->o_tmpmemctx );
 
 		if ( !cur_node ) {
@@ -518,7 +550,7 @@ range_err:
 			}
 			for (i=0; tmp_node != cur_node;
 				tmp_node = tavl_next( tmp_node, dir ), i++);
-			so->so_vlv_target = i;
+			so->so_vlv_target = (dir == TAVL_DIR_RIGHT) ? i+1 : so->so_nentries - i;
 		}
 		if ( bv.bv_val != vc->vc_value.bv_val )
 			op->o_tmpfree( bv.bv_val, op->o_tmpmemctx );
@@ -568,6 +600,8 @@ static void send_page( Operation *op, SlapReply *rs, sort_op *so )
 	Entry *e;
 	int rc;
 
+	rs->sr_attrs = op->ors_attrs;
+
 	while ( cur_node && rs->sr_nentries < so->so_page_size ) {
 		sort_node *sn = cur_node->avl_data;
 
@@ -596,6 +630,8 @@ static void send_page( Operation *op, SlapReply *rs, sort_op *so )
 
 	/* Set the first entry to send for the next page */
 	so->so_tree = next_node;
+	if ( next_node )
+		next_node->avl_left = NULL;
 
 	op->o_bd = be;
 }
@@ -731,7 +767,7 @@ static int sssvlv_op_response(
 		op->o_tmpfree( sn, op->o_tmpmemctx );
 		sn = sn2;
 		sn->sn_conn = op->o_conn->c_conn_idx;
-		sn->sn_session = find_session_by_context( so->so_info->svi_max_percon, op->o_conn->c_conn_idx, so->so_vcontext, (PagedResultsCookie) so->so_tree );
+		sn->sn_session = find_session_by_so( so->so_info->svi_max_percon, op->o_conn->c_conn_idx, so );
 
 		/* Insert into the AVL tree */
 		tavl_insert(&(so->so_tree), sn, node_insert, avl_dup_error);
@@ -857,6 +893,9 @@ static int sssvlv_op_search(
 	}
 	ldap_pvt_thread_mutex_unlock( &sort_conns_mutex );
 	if ( ok ) {
+		/* If we're a global overlay, this check got bypassed */
+		if ( !op->ors_limit && limits_check( op, rs ))
+			return rs->sr_err;
 		/* are we continuing a VLV search? */
 		if ( so && vc && vc->vc_context ) {
 			so->so_ctrl = sc;
@@ -1051,6 +1090,9 @@ static int build_key(
 	return rs->sr_err;
 }
 
+/* Conforms to RFC4510 re: Criticality, original RFC2891 spec is broken
+ * Also see ITS#7253 for discussion
+ */
 static int sss_parseCtrl(
 	Operation		*op,
 	SlapReply		*rs,
@@ -1226,7 +1268,7 @@ static ConfigTable sssvlv_cfg[] = {
 		"( OLcfgOvAt:21.2 NAME 'olcSssVlvMaxKeys' "
 			"DESC 'Maximum number of Keys in a Sort request' "
 			"SYNTAX OMsInteger SINGLE-VALUE )", NULL, NULL },
-	{ "sssvlv-maxpercon", "num",
+	{ "sssvlv-maxperconn", "num",
 		2, 2, 0, ARG_INT|ARG_OFFSET,
 			(void *)offsetof(sssvlv_info, svi_max_percon),
 		"( OLcfgOvAt:21.3 NAME 'olcSssVlvMaxPerConn' "
@@ -1240,7 +1282,7 @@ static ConfigOCs sssvlv_ocs[] = {
 		"NAME 'olcSssVlvConfig' "
 		"DESC 'SSS VLV configuration' "
 		"SUP olcOverlayConfig "
-		"MAY ( olcSssVlvMax $ olcSssVlvMaxKeys ) )",
+		"MAY ( olcSssVlvMax $ olcSssVlvMaxKeys $ olcSssVlvMaxPerConn ) )",
 		Cft_Overlay, sssvlv_cfg, NULL, NULL },
 	{ NULL, 0, NULL }
 };

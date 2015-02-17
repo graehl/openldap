@@ -2,7 +2,7 @@
 /* $OpenLDAP$ */
 /* This work is part of OpenLDAP Software <http://www.openldap.org/>.
  *
- * Copyright 2005-2011 The OpenLDAP Foundation.
+ * Copyright 2005-2015 The OpenLDAP Foundation.
  * Portions copyright 2004-2005 Symas Corporation.
  * All rights reserved.
  *
@@ -72,7 +72,7 @@ static int auditlog_response(Operation *op, SlapReply *rs) {
 	FILE *f;
 	Attribute *a;
 	Modifications *m;
-	struct berval *b, *who = NULL;
+	struct berval *b, *who = NULL, peername;
 	char *what, *whatm, *suffix;
 	time_t stamp;
 	int i;
@@ -119,6 +119,7 @@ static int auditlog_response(Operation *op, SlapReply *rs) {
 	if ( !who )
 		who = &op->o_dn;
 
+	peername = op->o_conn->c_peer_name;
 	ldap_pvt_thread_mutex_lock(&ad->ad_mutex);
 	if((f = fopen(ad->ad_logfile, "a")) == NULL) {
 		ldap_pvt_thread_mutex_unlock(&ad->ad_mutex);
@@ -126,8 +127,9 @@ static int auditlog_response(Operation *op, SlapReply *rs) {
 	}
 
 	stamp = slap_get_time();
-	fprintf(f, "# %s %ld %s%s%s\n",
-		what, (long)stamp, suffix, who ? " " : "", who ? who->bv_val : "");
+	fprintf(f, "# %s %ld %s%s%s %s conn=%ld\n",
+		what, (long)stamp, suffix, who ? " " : "", who ? who->bv_val : "",
+		peername.bv_val ? peername.bv_val: "", op->o_conn->c_connid);
 
 	if ( !BER_BVISEMPTY( &op->o_conn->c_dn ) &&
 		(!who || !dn_match( who, &op->o_conn->c_dn )))
@@ -198,20 +200,6 @@ auditlog_db_init(
 }
 
 static int
-auditlog_db_close(
-	BackendDB *be,
-	ConfigReply *cr
-)
-{
-	slap_overinst *on = (slap_overinst *)be->bd_info;
-	auditlog_data *ad = on->on_bi.bi_private;
-
-	free( ad->ad_logfile );
-	ad->ad_logfile = NULL;
-	return 0;
-}
-
-static int
 auditlog_db_destroy(
 	BackendDB *be,
 	ConfigReply *cr
@@ -221,6 +209,7 @@ auditlog_db_destroy(
 	auditlog_data *ad = on->on_bi.bi_private;
 
 	ldap_pvt_thread_mutex_destroy( &ad->ad_mutex );
+	free( ad->ad_logfile );
 	free( ad );
 	return 0;
 }
@@ -230,7 +219,6 @@ int auditlog_initialize() {
 
 	auditlog.on_bi.bi_type = "auditlog";
 	auditlog.on_bi.bi_db_init = auditlog_db_init;
-	auditlog.on_bi.bi_db_close = auditlog_db_close;
 	auditlog.on_bi.bi_db_destroy = auditlog_db_destroy;
 	auditlog.on_response = auditlog_response;
 

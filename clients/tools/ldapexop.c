@@ -2,7 +2,7 @@
 /* $OpenLDAP$ */
 /* This work is part of OpenLDAP Software <http://www.openldap.org/>.
  *
- * Copyright 2005-2011 The OpenLDAP Foundation.
+ * Copyright 2005-2015 The OpenLDAP Foundation.
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -130,7 +130,7 @@ main( int argc, char *argv[] )
 		}
 
 	} else if ( strcasecmp( argv[ 0 ], "passwd" ) == 0 ) {
-		fprintf( stderr, "use ldappasswd(1) instead.\n\n", argv[ 0 ] );
+		fprintf( stderr, "use ldappasswd(1) instead.\n\n" );
 		usage();
 		/* TODO? */
 
@@ -213,7 +213,7 @@ main( int argc, char *argv[] )
 		struct timeval	tv;
 
 		if ( tool_check_abandon( ld, id ) ) {
-			return LDAP_CANCELLED;
+			tool_exit( ld, LDAP_CANCELLED );
 		}
 
 		tv.tv_sec = 0;
@@ -247,7 +247,7 @@ main( int argc, char *argv[] )
 		char		*retoid = NULL;
 		struct berval	*retdata = NULL;
 
-		rc = ldap_parse_extended_result( ld, res, &retoid, &retdata, 1 );
+		rc = ldap_parse_extended_result( ld, res, &retoid, &retdata, 0 );
 
 		if ( rc != LDAP_SUCCESS ) {
 			tool_perror( "ldap_parse_extended_result", rc, NULL, NULL, NULL, NULL );
@@ -294,7 +294,7 @@ main( int argc, char *argv[] )
 			printf(_("# extended operation response\n"));
 		}
 
-		rc = ldap_parse_extended_result( ld, res, &retoid, &retdata, 1 );
+		rc = ldap_parse_extended_result( ld, res, &retoid, &retdata, 0 );
 		if ( rc != LDAP_SUCCESS ) {
 			tool_perror( "ldap_parse_extended_result", rc, NULL, NULL, NULL, NULL );
 			rc = EXIT_FAILURE;
@@ -318,7 +318,8 @@ main( int argc, char *argv[] )
 		}
 	}
 
-	if( verbose || ( code != LDAP_SUCCESS ) || matcheddn || text || refs ) {
+	if( verbose || code != LDAP_SUCCESS ||
+		( matcheddn && *matcheddn ) || ( text && *text ) || refs ) {
 		printf( _("Result: %s (%d)\n"), ldap_err2string( code ), code );
 
 		if( text && *text ) {
@@ -350,8 +351,5 @@ skip:
 	/* disconnect from server */
 	if ( res )
 		ldap_msgfree( res );
-	tool_unbind( ld );
-	tool_destroy();
-
-	return code == LDAP_SUCCESS ? EXIT_SUCCESS : EXIT_FAILURE;
+	tool_exit( ld, code == LDAP_SUCCESS ? EXIT_SUCCESS : EXIT_FAILURE );
 }

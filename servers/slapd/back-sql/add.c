@@ -1,7 +1,7 @@
 /* $OpenLDAP$ */
 /* This work is part of OpenLDAP Software <http://www.openldap.org/>.
  *
- * Copyright 1999-2011 The OpenLDAP Foundation.
+ * Copyright 1999-2015 The OpenLDAP Foundation.
  * Portions Copyright 1999 Dmitry Kovalev.
  * Portions Copyright 2002 Pierangelo Masarati.
  * Portions Copyright 2004 Mark Adamson.
@@ -1219,7 +1219,7 @@ backsql_add( Operation *op, SlapReply *rs )
 
 	if ( !BACKSQL_IS_ADD( oc->bom_expect_return ) ) {
 		SWORD		ncols;
-		SQLINTEGER	value_len;
+		SQLLEN		value_len;
 
 		if ( BACKSQL_CREATE_NEEDS_SELECT( bi ) ) {
 			SQLFreeStmt( sth, SQL_DROP );

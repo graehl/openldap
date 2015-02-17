@@ -2,7 +2,7 @@
 /* $OpenLDAP$ */
 /* This work is part of OpenLDAP Software <http://www.openldap.org/>.
  *
- * Copyright 2005-2011 The OpenLDAP Foundation.
+ * Copyright 2005-2015 The OpenLDAP Foundation.
  * Portions Copyright 2003 Howard Chu.
  * All rights reserved.
  *
@@ -423,7 +423,8 @@ distproc_ldadd( CfEntryInfo *p, Entry *e, ConfigArgs *ca )
 		Debug( LDAP_DEBUG_ANY, "slapd-distproc: "
 			"unable to init %sunderlying database \"%s\".\n",
 			lc->lc_common_li == NULL ? "common " : "", e->e_name.bv_val, 0 );
-		return LDAP_CONSTRAINT_VIOLATION;
+		rc = LDAP_CONSTRAINT_VIOLATION;
+		goto done;
 	}
 
 	li = ca->be->be_private;
@@ -958,7 +959,6 @@ distproc_initialize( void )
 		return rc;
 	}
 
-#ifdef LDAP_DEVEL
 	rc = supported_feature_load( &slap_FEATURE_CANCHAINOPS );
 	if ( rc != LDAP_SUCCESS ) {
 		Debug( LDAP_DEBUG_ANY, "slapd-distproc: "
@@ -966,7 +966,6 @@ distproc_initialize( void )
 			rc, 0, 0 );
 		return rc;
 	}
-#endif
 
 	rc = register_supported_control( LDAP_CONTROL_X_RETURNCONTREF,
 			SLAP_CTRL_GLOBAL|SLAP_CTRL_ACCESS|SLAP_CTRL_HIDE, NULL,

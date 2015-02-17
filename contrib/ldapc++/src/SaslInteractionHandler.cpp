@@ -1,6 +1,6 @@
 // $OpenLDAP$
 /*
- * Copyright 2007, OpenLDAP Foundation, All Rights Reserved.
+ * Copyright 2007-2015 The OpenLDAP Foundation, All Rights Reserved.
  * COPYING RESTRICTIONS APPLY, see COPYRIGHT file
  */
 
@@ -11,6 +11,7 @@
 
 #ifdef HAVE_TERMIOS_H
 #include <termios.h>
+#include <unistd.h>
 #include <cstdio>
 #endif
 

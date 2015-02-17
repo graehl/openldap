@@ -1,7 +1,7 @@
 /* $OpenLDAP$ */
 /* This work is part of OpenLDAP Software <http://www.openldap.org/>.
  *
- * Copyright 1998-2011 The OpenLDAP Foundation.
+ * Copyright 1998-2015 The OpenLDAP Foundation.
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -367,7 +367,13 @@ ldap_get_option(
 		break;
 	
 	case LDAP_OPT_SESSION_REFCNT:
+		if(ld == NULL) {
+			/* bad param */
+			break;
+		} 
+		LDAP_MUTEX_LOCK( &ld->ld_ldcmutex );
 		* (int *) outvalue = ld->ld_ldcrefcnt;
+		LDAP_MUTEX_UNLOCK( &ld->ld_ldcmutex );
 		rc = LDAP_OPT_SUCCESS;
 		break;
 
@@ -778,19 +784,22 @@ ldap_set_option(
 
 	default:
 #ifdef HAVE_TLS
-		if ( ldap_pvt_tls_set_option( ld, option, (void *)invalue ) == 0 )
+		if ( ldap_pvt_tls_set_option( ld, option, (void *)invalue ) == 0 ) {
 			LDAP_MUTEX_UNLOCK( &lo->ldo_mutex );
 			return ( LDAP_OPT_SUCCESS );
+		}
 #endif
 #ifdef HAVE_CYRUS_SASL
-		if ( ldap_int_sasl_set_option( ld, option, (void *)invalue ) == 0 )
+		if ( ldap_int_sasl_set_option( ld, option, (void *)invalue ) == 0 ) {
 			LDAP_MUTEX_UNLOCK( &lo->ldo_mutex );
 			return ( LDAP_OPT_SUCCESS );
+		}
 #endif
 #ifdef HAVE_GSSAPI
-		if ( ldap_int_gssapi_set_option( ld, option, (void *)invalue ) == 0 )
+		if ( ldap_int_gssapi_set_option( ld, option, (void *)invalue ) == 0 ) {
 			LDAP_MUTEX_UNLOCK( &lo->ldo_mutex );
 			return ( LDAP_OPT_SUCCESS );
+		}
 #endif
 		/* bad param */
 		break;	/* LDAP_OPT_ERROR */

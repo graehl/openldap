@@ -1,7 +1,7 @@
 /* $OpenLDAP$ */
 /* This work is part of OpenLDAP Software <http://www.openldap.org/>.
  *
- * Copyright 1999-2011 The OpenLDAP Foundation.
+ * Copyright 1999-2015 The OpenLDAP Foundation.
  * Portions Copyright 2001-2003 Pierangelo Masarati.
  * Portions Copyright 1999-2003 Howard Chu.
  * All rights reserved.
@@ -421,8 +421,10 @@ retry_lock:;
 	ldap_set_option( msc->msc_ld, LDAP_OPT_REFERRALS,
 		META_BACK_TGT_CHASE_REFERRALS( mt ) ? LDAP_OPT_ON : LDAP_OPT_OFF );
 
+	slap_client_keepalive(msc->msc_ld, &mt->mt_tls.sb_keepalive);
+
 #ifdef HAVE_TLS
-	if ( !is_ldaps ) {
+	{
 		slap_bindconf *sb = NULL;
 
 		if ( ispriv ) {
@@ -437,13 +439,15 @@ retry_lock:;
 			ldap_set_option( msc->msc_ld, LDAP_OPT_X_TLS_CTX, sb->sb_tls_ctx );
 		}
 
-		if ( sb == &mt->mt_idassert.si_bc && sb->sb_tls_ctx ) {
-			do_start_tls = 1;
+		if ( !is_ldaps ) {
+			if ( sb == &mt->mt_idassert.si_bc && sb->sb_tls_ctx ) {
+				do_start_tls = 1;
 
-		} else if ( META_BACK_TGT_USE_TLS( mt )
-			|| ( op->o_conn->c_is_tls && META_BACK_TGT_PROPAGATE_TLS( mt ) ) )
-		{
-			do_start_tls = 1;
+			} else if ( META_BACK_TGT_USE_TLS( mt )
+				|| ( op->o_conn->c_is_tls && META_BACK_TGT_PROPAGATE_TLS( mt ) ) )
+			{
+				do_start_tls = 1;
+			}
 		}
 	}
 
@@ -762,6 +766,7 @@ meta_back_retry(
 
 		if ( rc == LDAP_SUCCESS ) {
 			quarantine = 0;
+			LDAP_BACK_CONN_BINDING_SET( msc ); binding = 1;
 			rc = meta_back_single_dobind( op, rs, mcp, candidate,
 				sendok, mt->mt_nretries, 0 );
 
@@ -784,10 +789,12 @@ meta_back_retry(
 					LDAP_BACK_CONN_BINDING_CLEAR( msc );
 				}
 			}
-        	}
+		}
 
+#if 0	/* ITS#7591, following stmt drops needed result msgs */
 		/* don't send twice */
 		sendok &= ~LDAP_BACK_SENDERR;
+#endif
 	}
 
 	if ( rc != LDAP_SUCCESS ) {
@@ -1179,8 +1186,8 @@ retry_lock:;
 				mc = NULL;
 
 			} else {
-				if ( ( mi->mi_conn_ttl != 0 && op->o_time > mc->mc_create_time + mi->mi_conn_ttl )
-					|| ( mi->mi_idle_timeout != 0 && op->o_time > mc->mc_time + mi->mi_idle_timeout ) )
+				if ( mc->mc_refcnt == 0 && (( mi->mi_conn_ttl != 0 && op->o_time > mc->mc_create_time + mi->mi_conn_ttl )
+					|| ( mi->mi_idle_timeout != 0 && op->o_time > mc->mc_time + mi->mi_idle_timeout )) )
 				{
 #if META_BACK_PRINT_CONNTREE > 0
 					meta_back_print_conntree( mi,
@@ -1537,7 +1544,7 @@ retry_lock2:;
 
 			if ( i == cached 
 				|| meta_back_is_candidate( mt, &op->o_req_ndn,
-					LDAP_SCOPE_SUBTREE ) )
+					op->o_tag == LDAP_REQ_SEARCH ? op->ors_scope : LDAP_SCOPE_SUBTREE ) )
 			{
 
 				/*

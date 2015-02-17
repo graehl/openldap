@@ -1,5 +1,5 @@
 .TH SLAPD.CONF 5 "RELEASEDATE" "OpenLDAP LDVERSION"
-.\" Copyright 1998-2011 The OpenLDAP Foundation All Rights Reserved.
+.\" Copyright 1998-2015 The OpenLDAP Foundation All Rights Reserved.
 .\" Copying restrictions apply.  See COPYRIGHT/LICENSE.
 .\" $OpenLDAP$
 .SH NAME
@@ -494,6 +494,16 @@ option.
 .B include <filename>
 Read additional configuration information from the given file before
 continuing with the next line of the current file.
+.TP
+.B index_hash64 { on | off }
+Use a 64 bit hash for indexing. The default is to use 32 bit hashes.
+These hashes are used for equality and substring indexing. The 64 bit
+version may be needed to avoid index collisions when the number of
+indexed values exceeds ~64 million. (Note that substring indexing
+generates multiple index values per actual attribute value.)
+Indices generated with 32 bit hashes are incompatible with the 64 bit
+version, and vice versa. Any existing databases must be fully reloaded
+when changing this setting. This directive is only supported on 64 bit CPUs.
 .TP
 .B index_intlen <integer>
 Specify the key length for ordered integer indices. The most significant
@@ -1034,7 +1044,8 @@ you can specify.
 .TP
 .B TLSCipherSuite <cipher-suite-spec>
 Permits configuring what ciphers will be accepted and the preference order.
-<cipher-suite-spec> should be a cipher specification for OpenSSL resp. GNUtls.
+<cipher-suite-spec> should be a cipher specification for the TLS library
+in use (OpenSSL, GnuTLS, or Mozilla NSS).
 Example:
 .RS
 .RS
@@ -1042,7 +1053,7 @@ Example:
 .I OpenSSL:
 TLSCipherSuite HIGH:MEDIUM:+SSLv2
 .TP
-.I GNUtls:
+.I GnuTLS:
 TLSCiphersuite SECURE256:!AES-128-CBC
 .RE
 
@@ -1052,17 +1063,25 @@ To check what ciphers a given spec selects in OpenSSL, use:
 	openssl ciphers \-v <cipher-suite-spec>
 .fi
 
-With GNUtls the available specs can be found in the manual page of 
+With GnuTLS the available specs can be found in the manual page of 
 .BR gnutls\-cli (1)
 (see the description of the 
 option
 .BR \-\-priority ).
 
-In older versions of GNUtls, where gnutls\-cli does not support the option
+In older versions of GnuTLS, where gnutls\-cli does not support the option
 \-\-priority, you can obtain the \(em more limited \(em list of ciphers by calling:
 
 .nf
 	gnutls\-cli \-l
+.fi
+
+When using Mozilla NSS, the OpenSSL cipher suite specifications are used and
+translated into the format used internally by Mozilla NSS.  There isn't an easy
+way to list the cipher suites from the command line.  The authoritative list
+is in the source code for Mozilla NSS in the file sslinfo.c in the structure
+.nf
+        static const SSLCipherSuiteInfo suiteInfo[]
 .fi
 .RE
 .TP
@@ -1070,18 +1089,44 @@ In older versions of GNUtls, where gnutls\-cli does not support the option
 Specifies the file that contains certificates for all of the Certificate
 Authorities that
 .B slapd
-will recognize.
+will recognize.  The certificate for
+the CA that signed the server certificate must be included among
+these certificates. If the signing CA was not a top-level (root) CA,
+certificates for the entire sequence of CA's from the signing CA to
+the top-level CA should be present. Multiple certificates are simply
+appended to the file; the order is not significant.
 .TP
 .B TLSCACertificatePath <path>
 Specifies the path of a directory that contains Certificate Authority
 certificates in separate individual files. Usually only one of this
 or the TLSCACertificateFile is used. This directive is not supported
-when using GNUtls.
+when using GnuTLS.
+
+When using Mozilla NSS, <path> may contain a Mozilla NSS cert/key
+database.  If <path> contains a Mozilla NSS cert/key database and
+CA cert files, OpenLDAP will use the cert/key database and will
+ignore the CA cert files.
 .TP
 .B TLSCertificateFile <filename>
 Specifies the file that contains the
 .B slapd
 server certificate.
+
+When using Mozilla NSS, if using a cert/key database (specified with
+TLSCACertificatePath), TLSCertificateFile specifies
+the name of the certificate to use:
+.nf
+	TLSCertificateFile Server-Cert
+.fi
+If using a token other than the internal built in token, specify the
+token name first, followed by a colon:
+.nf
+	TLSCertificateFile my hardware device:Server-Cert
+.fi
+Use certutil -L to list the certificates by name:
+.nf
+	certutil -d /path/to/certdbdir -L
+.fi
 .TP
 .B TLSCertificateKeyFile <filename>
 Specifies the file that contains the
@@ -1090,23 +1135,62 @@ server private key that matches the certificate stored in the
 .B TLSCertificateFile
 file.  Currently, the private key must not be protected with a password, so
 it is of critical importance that it is protected carefully. 
+
+When using Mozilla NSS, TLSCertificateKeyFile specifies the name of
+a file that contains the password for the key for the certificate specified with
+TLSCertificateFile.  The modutil command can be used to turn off password
+protection for the cert/key database.  For example, if TLSCACertificatePath
+specifes /etc/openldap/certdb as the location of the cert/key database, use
+modutil to change the password to the empty string:
+.nf
+	modutil -dbdir /etc/openldap/certdb -changepw 'NSS Certificate DB'
+.fi
+You must have the old password, if any.  Ignore the WARNING about the running
+browser.  Press 'Enter' for the new password.
 .TP
 .B TLSDHParamFile <filename>
 This directive specifies the file that contains parameters for Diffie-Hellman
 ephemeral key exchange.  This is required in order to use a DSA certificate on
-the server. If multiple sets of parameters are present in the file, all of
-them will be processed.  Note that setting this option may also enable
+the server, or an RSA certificate missing the "key encipherment" key usage.
+Note that setting this option may also enable
 Anonymous Diffie-Hellman key exchanges in certain non-default cipher suites.
-You should append "!ADH" to your cipher suites if you have changed them
-from the default, otherwise no certificate exchanges or verification will
-be done. When using GNUtls these parameters are always generated randomly so
-this directive is ignored.
+Anonymous key exchanges should generally be avoided since they provide no
+actual client or server authentication and provide no protection against
+man-in-the-middle attacks.
+You should append "!ADH" to your cipher suites to ensure that these suites
+are not used.
+When using Mozilla NSS these parameters are always generated randomly
+so this directive is ignored.
+.TP
+.B TLSECName <name>
+Specify the name of a curve to use for Elliptic curve Diffie-Hellman
+ephemeral key exchange.  This is required to enable ECDHE algorithms in
+OpenSSL.  This option is not used with GnuTLS; the curves may be
+chosen in the GnuTLS ciphersuite specification. This option is also
+ignored for Mozilla NSS.
+.TP
+.B TLSProtocolMin <major>[.<minor>]
+Specifies minimum SSL/TLS protocol version that will be negotiated.
+If the server doesn't support at least that version,
+the SSL handshake will fail.
+To require TLS 1.x or higher, set this option to 3.(x+1),
+e.g.,
+
+.nf
+	TLSProtocolMin 3.2
+.fi
+
+would require TLS 1.1.
+Specifying a minimum that is higher than that supported by the
+OpenLDAP implementation will result in it requiring the
+highest level that it does support.
+This directive is ignored with GnuTLS.
 .TP
 .B TLSRandFile <filename>
 Specifies the file to obtain random bits from when /dev/[u]random
 is not available.  Generally set to the name of the EGD/PRNGD socket.
 The environment variable RANDFILE can also be used to specify the filename.
-This directive is ignored with GNUtls.
+This directive is ignored with GnuTLS and Mozilla NSS.
 .TP
 .B TLSVerifyClient <level>
 Specifies what checks to perform on client certificates in an
@@ -1148,7 +1232,7 @@ Specifies if the Certificate Revocation List (CRL) of the CA should be
 used to verify if the client certificates have not been revoked. This
 requires
 .B TLSCACertificatePath
-parameter to be set. This directive is ignored with GNUtls.
+parameter to be set. This directive is ignored with GnuTLS and Mozilla NSS.
 .B <level>
 can be specified as one of the following keywords:
 .RS
@@ -1166,7 +1250,7 @@ Check the CRL for a whole certificate chain
 .B TLSCRLFile <filename>
 Specifies a file containing a Certificate Revocation List to be used
 for verifying that certificates have not been revoked. This directive is
-only valid when using GNUtls.
+only valid when using GnuTLS and Mozilla NSS.
 .SH GENERAL BACKEND OPTIONS
 Options in this section only apply to the configuration file section
 for the specified backend.  They are supported by every
@@ -1181,6 +1265,7 @@ should be one of
 .BR hdb ,
 .BR ldap ,
 .BR ldif ,
+.BR mdb ,
 .BR meta ,
 .BR monitor ,
 .BR null ,
@@ -1210,6 +1295,7 @@ should be one of
 .BR hdb ,
 .BR ldap ,
 .BR ldif ,
+.BR mdb ,
 .BR meta ,
 .BR monitor ,
 .BR null ,
@@ -1643,7 +1729,7 @@ when using the \fIsyncprov\fP overlay, which needs to follow \fIglue\fP
 in order to work over all of the glued databases. E.g.
 .RS
 .nf
-	database bdb
+	database mdb
 	suffix dc=example,dc=com
 	...
 	overlay glue
@@ -1666,6 +1752,7 @@ the contextCSN is stored in the context entry.
 .B [filter=<filter str>]
 .B [scope=sub|one|base|subord]
 .B [attrs=<attr list>]
+.B [exattrs=<attr list>]
 .B [attrsonly]
 .B [sizelimit=<limit>]
 .B [timelimit=<limit>]
@@ -1689,6 +1776,7 @@ the contextCSN is stored in the context entry.
 .B [tls_reqcert=never|allow|try|demand]
 .B [tls_ciphersuite=<ciphers>]
 .B [tls_crlcheck=none|peer|all]
+.B [tls_protocol_min=<major>[.<minor>]]
 .B [suffixmassage=<real DN>]
 .B [logbase=<base DN>]
 .B [logfilter=<filter str>]
@@ -1744,6 +1832,19 @@ a consumer requested limitation on the number of entries that can be returned
 by the LDAP Content Synchronization operation; as such, it is intended
 to implement partial replication based on the size of the replicated database
 and on the time required by the synchronization.
+Note, however, that any provider-side limits for the replication identity
+will be enforced by the provider regardless of the limits requested
+by the LDAP Content Synchronization operation, much like for any other
+search operation.
+.B exattrs
+option may also be used to specify attributes that should be omitted
+from incoming entries.
+The \fBscope\fP defaults to \fBsub\fP, the \fBfilter\fP defaults to
+\fB(objectclass=*)\fP, and there is no default \fBsearchbase\fP. The
+\fBattrs\fP list defaults to \fB"*,+"\fP to return all user and operational
+attributes, and \fBattrsonly\fP and \fBexattrs\fP are unset by default.
+The \fBsizelimit\fP and \fBtimelimit\fP only
+accept "unlimited" and positive integers, and both default to "unlimited".
 Note, however, that any provider-side limits for the replication identity
 will be enforced by the provider regardless of the limits requested
 by the LDAP Content Synchronization operation, much like for any other
@@ -1935,7 +2036,7 @@ access    to attrs=userPassword  by * auth
 # Read access to other attributes and entries.
 access    to *  by * read
 
-database  bdb
+database  mdb
 suffix    "dc=our\-domain,dc=com"
 # The database directory MUST exist prior to
 # running slapd AND should only be accessible
@@ -1969,7 +2070,6 @@ default slapd configuration file
 .BR slapd.backends (5),
 .BR slapd.overlays (5),
 .BR slapd.plugin (5),
-.BR slapd.replog (5),
 .BR slapd (8),
 .BR slapacl (8),
 .BR slapadd (8),

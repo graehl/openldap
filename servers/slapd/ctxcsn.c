@@ -2,7 +2,7 @@
 /* $OpenLDAP$ */
 /* This work is part of OpenLDAP Software <http://www.openldap.org/>.
  *
- * Copyright 2003-2011 The OpenLDAP Foundation.
+ * Copyright 2003-2015 The OpenLDAP Foundation.
  * Portions Copyright 2003 IBM Corporation.
  * All rights reserved.
  *
@@ -50,11 +50,11 @@ slap_get_commit_csn(
 		*foundit = 0;
 	}
 
-	ldap_pvt_thread_mutex_lock( &be->be_pcl_mutex );
-
 	if ( !BER_BVISEMPTY( &op->o_csn )) {
 		sid = slap_parse_csn_sid( &op->o_csn );
 	}
+
+	ldap_pvt_thread_mutex_lock( &be->be_pcl_mutex );
 
 	LDAP_TAILQ_FOREACH( csne, be->be_pending_csn_list, ce_csn_link ) {
 		if ( csne->ce_opid == op->o_opid && csne->ce_connid == op->o_connid ) {
@@ -186,9 +186,7 @@ slap_queue_csn(
 	pending = (struct slap_csn_entry *) ch_calloc( 1,
 			sizeof( struct slap_csn_entry ));
 
-	Debug( LDAP_DEBUG_SYNC, "slap_queue_csn: queing %p %s\n", csn->bv_val, csn->bv_val, 0 );
-
-	ldap_pvt_thread_mutex_lock( &be->be_pcl_mutex );
+	Debug( LDAP_DEBUG_SYNC, "slap_queue_csn: queueing %p %s\n", csn->bv_val, csn->bv_val, 0 );
 
 	ber_dupbv( &pending->ce_csn, csn );
 	ber_bvreplace_x( &op->o_csn, &pending->ce_csn, op->o_tmpmemctx );
@@ -196,6 +194,8 @@ slap_queue_csn(
 	pending->ce_connid = op->o_connid;
 	pending->ce_opid = op->o_opid;
 	pending->ce_state = SLAP_CSN_PENDING;
+
+	ldap_pvt_thread_mutex_lock( &be->be_pcl_mutex );
 	LDAP_TAILQ_INSERT_TAIL( be->be_pending_csn_list,
 		pending, ce_csn_link );
 	ldap_pvt_thread_mutex_unlock( &be->be_pcl_mutex );

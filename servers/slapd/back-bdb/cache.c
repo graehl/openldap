@@ -2,7 +2,7 @@
 /* $OpenLDAP$ */
 /* This work is part of OpenLDAP Software <http://www.openldap.org/>.
  *
- * Copyright 2000-2011 The OpenLDAP Foundation.
+ * Copyright 2000-2015 The OpenLDAP Foundation.
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -1146,6 +1146,7 @@ bdb_cache_add(
 	ei.bei_nrdn = *nrdn;
 	ei.bei_lockpad = 0;
 
+#if 0
 	/* Lock this entry so that bdb_add can run to completion.
 	 * It can only fail if BDB has run out of lock resources.
 	 */
@@ -1154,6 +1155,7 @@ bdb_cache_add(
 		bdb_cache_entryinfo_unlock( eip );
 		return rc;
 	}
+#endif
 
 #ifdef BDB_HIER
 	if ( nrdn->bv_len != e->e_nname.bv_len ) {
@@ -1197,12 +1199,22 @@ bdb_cache_add(
 	}
 	ldap_pvt_thread_mutex_unlock( &bdb->bi_cache.c_count_mutex );
 
+	new->bei_finders = 1;
 	bdb_cache_lru_link( bdb, new );
 
 	if ( purge )
 		bdb_cache_lru_purge( bdb );
 
 	return rc;
+}
+
+void bdb_cache_deref(
+	EntryInfo *ei
+	)
+{
+	bdb_cache_entryinfo_lock( ei );
+	ei->bei_finders--;
+	bdb_cache_entryinfo_unlock( ei );
 }
 
 int
@@ -1349,7 +1361,7 @@ bdb_cache_delete(
     DB_LOCK	*lock )
 {
 	EntryInfo *ei = BEI(e);
-	int	rc, busy = 0;
+	int	rc, busy = 0, counter = 0;
 
 	assert( e->e_private != NULL );
 
@@ -1366,7 +1378,7 @@ bdb_cache_delete(
 
 	bdb_cache_entryinfo_unlock( ei );
 
-	while ( busy ) {
+	while ( busy && counter < 1000) {
 		ldap_pvt_thread_yield();
 		busy = 0;
 		bdb_cache_entryinfo_lock( ei );
@@ -1375,6 +1387,13 @@ bdb_cache_delete(
 			ei->bei_finders > 0 )
 			busy = 1;
 		bdb_cache_entryinfo_unlock( ei );
+		counter ++;
+	}
+	if( busy ) {
+		bdb_cache_entryinfo_lock( ei );
+		ei->bei_state ^= CACHE_ENTRY_DELETED;
+		bdb_cache_entryinfo_unlock( ei );
+		return DB_LOCK_DEADLOCK;
 	}
 
 	/* Get write lock on the data */
@@ -1545,7 +1564,7 @@ bdb_lru_count( Cache *cache )
 			ent++;
 			if ( e->bei_state & CACHE_ENTRY_NOT_CACHED )
 				nc++;
-			fprintf( stderr, "ei %d entry %p dn %s\n", ei, e->bei_e, e->bei_e->e_name.bv_val );
+			fprintf( stderr, "ei %d entry %p dn %s\n", ei, (void *) e->bei_e, e->bei_e->e_name.bv_val );
 		}
 		e = e->bei_lrunext;
 		if ( e == cache->c_lrutail )

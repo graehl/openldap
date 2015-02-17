@@ -1,7 +1,7 @@
 /* $OpenLDAP$ */
 /* This work is part of OpenLDAP Software <http://www.openldap.org/>.
  *
- * Copyright 1998-2011 The OpenLDAP Foundation.
+ * Copyright 1998-2015 The OpenLDAP Foundation.
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -97,13 +97,14 @@ ldap_ld_free(
 		if ( ld->ld_referrals != NULL) {
 			LDAP_VFREE(ld->ld_referrals);
 			ld->ld_referrals = NULL;
-		}  
+		}
 		LDAP_MUTEX_UNLOCK( &ld->ld_ldcmutex );
 		LDAP_FREE( (char *) ld );
 		return( err );
 	}
 
 	/* This ld is the last thread. */
+	LDAP_MUTEX_UNLOCK( &ld->ld_ldcmutex );
 
 	/* free LDAP structure and outstanding requests/responses */
 	LDAP_MUTEX_LOCK( &ld->ld_req_mutex );
@@ -123,12 +124,15 @@ ldap_ld_free(
 		next = lm->lm_next;
 		ldap_msgfree( lm );
 	}
-    
+
 	if ( ld->ld_abandoned != NULL ) {
 		LDAP_FREE( ld->ld_abandoned );
 		ld->ld_abandoned = NULL;
 	}
 	LDAP_MUTEX_UNLOCK( &ld->ld_res_mutex );
+
+	ber_sockbuf_free( ld->ld_sb );
+
 	LDAP_MUTEX_LOCK( &ld->ld_ldopts_mutex );
 
 	/* final close callbacks */
@@ -156,8 +160,8 @@ ldap_ld_free(
 	if ( ld->ld_referrals != NULL) {
 		LDAP_VFREE(ld->ld_referrals);
 		ld->ld_referrals = NULL;
-	}  
-    
+	}
+
 	if ( ld->ld_selectinfo != NULL ) {
 		ldap_free_select_info( ld->ld_selectinfo );
 		ld->ld_selectinfo = NULL;
@@ -217,8 +221,6 @@ ldap_ld_free(
 	}
 	LDAP_MUTEX_UNLOCK( &ld->ld_ldopts_mutex );
 
-	ber_sockbuf_free( ld->ld_sb );   
-   
 #ifdef LDAP_R_COMPILE
 	ldap_pvt_thread_mutex_destroy( &ld->ld_msgid_mutex );
 	ldap_pvt_thread_mutex_destroy( &ld->ld_conn_mutex );
@@ -226,7 +228,6 @@ ldap_ld_free(
 	ldap_pvt_thread_mutex_destroy( &ld->ld_res_mutex );
 	ldap_pvt_thread_mutex_destroy( &ld->ld_abandon_mutex );
 	ldap_pvt_thread_mutex_destroy( &ld->ld_ldopts_mutex );
-	ldap_pvt_thread_mutex_unlock( &ld->ld_ldcmutex );
 	ldap_pvt_thread_mutex_destroy( &ld->ld_ldcmutex );
 #endif
 #ifndef NDEBUG
@@ -234,7 +235,7 @@ ldap_ld_free(
 #endif
 	LDAP_FREE( (char *) ld->ldc );
 	LDAP_FREE( (char *) ld );
-   
+
 	return( err );
 }
 

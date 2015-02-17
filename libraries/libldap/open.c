@@ -1,7 +1,7 @@
 /* $OpenLDAP$ */
 /* This work is part of OpenLDAP Software <http://www.openldap.org/>.
  *
- * Copyright 1998-2011 The OpenLDAP Foundation.
+ * Copyright 1998-2015 The OpenLDAP Foundation.
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -268,6 +268,9 @@ ldap_init_fd(
 	int rc;
 	LDAP *ld;
 	LDAPConn *conn;
+#ifdef LDAP_CONNECTIONLESS
+	ber_socklen_t	len;
+#endif
 
 	*ldp = NULL;
 	rc = ldap_create( &ld );
@@ -308,6 +311,15 @@ ldap_init_fd(
 
 #ifdef LDAP_CONNECTIONLESS
 	case LDAP_PROTO_UDP:
+		LDAP_IS_UDP(ld) = 1;
+		if( ld->ld_options.ldo_peer )
+			ldap_memfree( ld->ld_options.ldo_peer );
+		ld->ld_options.ldo_peer = ldap_memcalloc( 1, sizeof( struct sockaddr_storage ) );
+		len = sizeof( struct sockaddr_storage );
+		if( getpeername ( fd, ld->ld_options.ldo_peer, &len ) < 0) {
+			ldap_unbind_ext( ld, NULL, NULL );
+			return( AC_SOCKET_ERROR );
+		}
 #ifdef LDAP_DEBUG
 		ber_sockbuf_add_io( conn->lconn_sb, &ber_sockbuf_io_debug,
 			LBER_SBIOD_LEVEL_PROVIDER, (void *)"udp_" );
@@ -344,7 +356,6 @@ ldap_init_fd(
 
 	/* Add the connection to the *LDAP's select pool */
 	ldap_mark_select_read( ld, conn->lconn_sb );
-	ldap_mark_select_write( ld, conn->lconn_sb );
 	
 	*ldp = ld;
 	return LDAP_SUCCESS;
@@ -429,8 +440,8 @@ ldap_int_open_connection(
 #endif
 
 #ifdef HAVE_TLS
-	if (ld->ld_options.ldo_tls_mode == LDAP_OPT_X_TLS_HARD ||
-		strcmp( srv->lud_scheme, "ldaps" ) == 0 )
+	if (rc == 0 && ( ld->ld_options.ldo_tls_mode == LDAP_OPT_X_TLS_HARD ||
+		strcmp( srv->lud_scheme, "ldaps" ) == 0 ))
 	{
 		++conn->lconn_refcnt;	/* avoid premature free */
 
@@ -447,6 +458,11 @@ ldap_int_open_connection(
 	return( 0 );
 }
 
+/*
+ * ldap_open_internal_connection - open connection and set file descriptor
+ *
+ * note: ldap_init_fd() may be preferable
+ */
 
 int
 ldap_open_internal_connection( LDAP **ldp, ber_socket_t *fdp )
@@ -497,12 +513,13 @@ ldap_open_internal_connection( LDAP **ldp, ber_socket_t *fdp )
 
 	/* Add the connection to the *LDAP's select pool */
 	ldap_mark_select_read( ld, c->lconn_sb );
-	ldap_mark_select_write( ld, c->lconn_sb );
 
 	/* Make this connection an LDAP V3 protocol connection */
 	rc = LDAP_VERSION3;
 	ldap_set_option( ld, LDAP_OPT_PROTOCOL_VERSION, &rc );
 	*ldp = ld;
+
+	++ld->ld_defconn->lconn_refcnt;	/* so it never gets closed/freed */
 
 	return( LDAP_SUCCESS );
 }
@@ -527,4 +544,41 @@ ldap_dup( LDAP *old )
 	old->ld_ldcrefcnt++;
 	LDAP_MUTEX_UNLOCK( &old->ld_ldcmutex );
 	return ( ld );
+}
+
+int
+ldap_int_check_async_open( LDAP *ld, ber_socket_t sd )
+{
+	struct timeval tv = { 0 };
+	int rc;
+
+	rc = ldap_int_poll( ld, sd, &tv, 1 );
+	switch ( rc ) {
+	case 0:
+		/* now ready to start tls */
+		ld->ld_defconn->lconn_status = LDAP_CONNST_CONNECTED;
+		break;
+
+	default:
+		ld->ld_errno = LDAP_CONNECT_ERROR;
+		return -1;
+
+	case -2:
+		/* connect not completed yet */
+		ld->ld_errno = LDAP_X_CONNECTING;
+		return rc;
+	}
+
+#ifdef HAVE_TLS
+	if ( ld->ld_options.ldo_tls_mode == LDAP_OPT_X_TLS_HARD ||
+		!strcmp( ld->ld_defconn->lconn_server->lud_scheme, "ldaps" )) {
+
+		++ld->ld_defconn->lconn_refcnt;	/* avoid premature free */
+
+		rc = ldap_int_tls_start( ld, ld->ld_defconn, ld->ld_defconn->lconn_server );
+
+		--ld->ld_defconn->lconn_refcnt;
+	}
+#endif
+	return rc;
 }

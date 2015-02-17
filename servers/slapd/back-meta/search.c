@@ -1,7 +1,7 @@
 /* $OpenLDAP$ */
 /* This work is part of OpenLDAP Software <http://www.openldap.org/>.
  *
- * Copyright 1999-2011 The OpenLDAP Foundation.
+ * Copyright 1999-2015 The OpenLDAP Foundation.
  * Portions Copyright 2001-2003 Pierangelo Masarati.
  * Portions Copyright 1999-2003 Howard Chu.
  * All rights reserved.
@@ -32,9 +32,7 @@
 #include "slap.h"
 #include "../back-ldap/back-ldap.h"
 #include "back-meta.h"
-#undef ldap_debug	/* silence a warning in ldap-int.h */
-#include "ldap_log.h"
-#include "../../../libraries/libldap/ldap-int.h"
+#include "../../../libraries/liblber/lber-int.h"
 
 /* IGNORE means that target does not (no longer) participate
  * in the search;
@@ -237,6 +235,10 @@ meta_search_dobind_init(
 
 	assert( msc->msc_ld != NULL );
 
+	/* connect must be async only the first time... */
+	ldap_set_option( msc->msc_ld, LDAP_OPT_CONNECT_ASYNC, LDAP_OPT_ON );
+
+retry:;
 	if ( !BER_BVISEMPTY( &binddn ) && BER_BVISEMPTY( &cred ) ) {
 		/* bind anonymously? */
 		Debug( LDAP_DEBUG_ANY, "%s meta_search_dobind_init[%d] mc=%p: "
@@ -249,13 +251,10 @@ meta_search_dobind_init(
 		Debug( LDAP_DEBUG_ANY, "%s meta_search_dobind_init[%d] mc=%p: "
 			"empty dn with non-empty cred: error\n",
 			op->o_log_prefix, candidate, (void *)mc );
+		rc = LDAP_OTHER;
 		goto other;
 	}
 
-	/* connect must be async only the first time... */
-	ldap_set_option( msc->msc_ld, LDAP_OPT_CONNECT_ASYNC, LDAP_OPT_ON );
-
-retry:;
 	rc = ldap_sasl_bind( msc->msc_ld, binddn.bv_val, LDAP_SASL_SIMPLE, &cred,
 			NULL, NULL, &candidates[ candidate ].sr_msgid );
 
@@ -329,13 +328,15 @@ down:;
 
 			if ( rc == LDAP_SUCCESS ) {
 				candidates[ candidate ].sr_msgid = META_MSGID_IGNORE;
+				binddn = msc->msc_bound_ndn;
+				cred = msc->msc_cred;
 				goto retry;
 			}
 		}
 
 		if ( *mcp == NULL ) {
 			retcode = META_SEARCH_ERR;
-			rs->sr_err = LDAP_UNAVAILABLE;
+			rc = LDAP_UNAVAILABLE;
 			candidates[ candidate ].sr_msgid = META_MSGID_IGNORE;
 			break;
 		}
@@ -353,7 +354,6 @@ other:;
 			LDAP_BACK_CONN_TAINTED_SET( mc );
 			meta_back_release_conn_lock( mi, mc, 0 );
 			*mcp = NULL;
-			rs->sr_err = rc;
 
 			retcode = META_SEARCH_ERR;
 
@@ -543,6 +543,20 @@ meta_back_search_start(
 			/*
 			 * this target is no longer candidate
 			 */
+			retcode = META_SEARCH_NOT_CANDIDATE;
+			goto doreturn;
+		}
+	}
+
+	/* check filter expression */
+	if ( mt->mt_filter ) {
+		metafilter_t *mf;
+		for ( mf = mt->mt_filter; mf; mf = mf->mf_next ) {
+			if ( regexec( &mf->mf_regex, op->ors_filterstr.bv_val, 0, NULL, 0 ) == 0 )
+				break;
+		}
+		/* nothing matched, this target is no longer a candidate */
+		if ( !mf ) {
 			retcode = META_SEARCH_NOT_CANDIDATE;
 			goto doreturn;
 		}
@@ -1613,8 +1627,6 @@ err_pr:;
 								}
 							}
 #endif /* SLAPD_META_CLIENT_PR */
-
-							ldap_controls_free( ctrls );
 						}
 						/* fallthru */
 
@@ -1636,6 +1648,7 @@ err_pr:;
 							|| META_BACK_ONERR_STOP( mi ) )
 						{
 							const char *save_text = rs->sr_text;
+got_err:
 							savepriv = op->o_private;
 							op->o_private = (void *)i;
 							rs->sr_text = candidates[ i ].sr_text;
@@ -1644,27 +1657,19 @@ err_pr:;
 							op->o_private = savepriv;
 							ldap_msgfree( res );
 							res = NULL;
+							ldap_controls_free( ctrls );
 							goto finish;
 						}
 						break;
 	
 					default:
 						candidates[ i ].sr_err = rs->sr_err;
-						if ( META_BACK_ONERR_STOP( mi ) ) {
-							const char *save_text = rs->sr_text;
-							savepriv = op->o_private;
-							op->o_private = (void *)i;
-							rs->sr_text = candidates[ i ].sr_text;
-							send_ldap_result( op, rs );
-							rs->sr_text = save_text;
-							op->o_private = savepriv;
-							ldap_msgfree( res );
-							res = NULL;
-							goto finish;
-						}
+						if ( META_BACK_ONERR_STOP( mi ) )
+							goto got_err;
 						break;
 					}
 	
+					ldap_controls_free( ctrls );
 					last = i;
 					rc = 0;
 	

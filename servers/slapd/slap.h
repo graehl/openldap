@@ -2,7 +2,7 @@
 /* $OpenLDAP$ */
 /* This work is part of OpenLDAP Software <http://www.openldap.org/>.
  *
- * Copyright 1998-2011 The OpenLDAP Foundation.
+ * Copyright 1998-2015 The OpenLDAP Foundation.
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -58,21 +58,20 @@
 
 LDAP_BEGIN_DECL
 
-#ifdef LDAP_DEVEL
 #define LDAP_COLLECTIVE_ATTRIBUTES
 #define LDAP_COMP_MATCH
 #define LDAP_SYNC_TIMESTAMP
-#define SLAP_CONTROL_X_SESSION_TRACKING
 #define SLAP_CONTROL_X_WHATFAILED
+#define SLAP_CONTROL_X_LAZY_COMMIT
 #define SLAP_CONFIG_DELETE
 #define SLAP_AUXPROP_DONTUSECOPY
 #ifndef SLAP_SCHEMA_EXPOSE
 #define SLAP_SCHEMA_EXPOSE
 #endif
-#endif
 
 #define LDAP_DYNAMIC_OBJECTS
 #define SLAP_CONTROL_X_TREE_DELETE LDAP_CONTROL_X_TREE_DELETE
+#define SLAP_CONTROL_X_SESSION_TRACKING
 #define SLAP_DISTPROC
 
 #ifdef ENABLE_REWRITE
@@ -143,10 +142,10 @@ LDAP_BEGIN_DECL
 
 #define SLAP_TEXT_BUFLEN (256)
 
-/* psuedo error code indicating abandoned operation */
+/* pseudo error code indicating abandoned operation */
 #define SLAPD_ABANDON (-1024)
 
-/* psuedo error code indicating disconnect */
+/* pseudo error code indicating disconnect */
 #define SLAPD_DISCONNECT (-1025)
 
 /* unknown config file directive */
@@ -851,6 +850,7 @@ struct AttributeDescription {
 #define SLAP_DESC_BINARY	0x01U
 #define SLAP_DESC_TAG_RANGE	0x80U
 #define SLAP_DESC_TEMPORARY	0x1000U
+	unsigned ad_index;
 };
 
 /* flags to slap_*2undef_ad to register undefined (0, the default)
@@ -1604,6 +1604,8 @@ LDAP_SLAPD_V (int) slapMode;
 #define SLAP_TOOL_NO_SCHEMA_CHECK	0x1000
 #define SLAP_TOOL_VALUE_CHECK	0x2000
 
+#define SLAP_SERVER_RUNNING	0x8000
+
 #define SB_TLS_DEFAULT		(-1)
 #define SB_TLS_OFF		0
 #define SB_TLS_ON		1
@@ -1750,12 +1752,12 @@ struct syncinfo_s;
 #define SLAP_SYNCUUID_SET_SIZE 256
 
 struct sync_cookie {
-	struct berval *ctxcsn;
-	struct berval octet_str;
-	int rid;
-	int sid;
-	int numcsns;
+	BerVarray ctxcsn;
 	int *sids;
+	int numcsns;
+	int rid;
+	struct berval octet_str;
+	int sid;
 	LDAP_STAILQ_ENTRY(sync_cookie) sc_next;
 };
 
@@ -1822,6 +1824,7 @@ struct BackendDB {
 #define		be_sync bd_info->bi_tool_sync
 #define		be_dn2id_get bd_info->bi_tool_dn2id_get
 #define		be_entry_modify	bd_info->bi_tool_entry_modify
+#define		be_entry_delete	bd_info->bi_tool_entry_delete
 #endif
 
 	/* supported controls */
@@ -1850,11 +1853,14 @@ struct BackendDB {
 #define SLAP_DBFLAG_CLEAN		0x10000U /* was cleanly shutdown */
 #define SLAP_DBFLAG_ACL_ADD		0x20000U /* check attr ACLs on adds */
 #define SLAP_DBFLAG_SYNC_SUBENTRY	0x40000U /* use subentry for context */
+#define SLAP_DBFLAG_MULTI_SHADOW	0x80000U /* uses mirrorMode/multi-master */
+#define SLAP_DBFLAG_DISABLED	0x100000U
 	slap_mask_t	be_flags;
 #define SLAP_DBFLAGS(be)			((be)->be_flags)
 #define SLAP_NOLASTMOD(be)			(SLAP_DBFLAGS(be) & SLAP_DBFLAG_NOLASTMOD)
 #define SLAP_LASTMOD(be)			(!SLAP_NOLASTMOD(be))
 #define SLAP_DBHIDDEN(be)			(SLAP_DBFLAGS(be) & SLAP_DBFLAG_HIDDEN)
+#define SLAP_DBDISABLED(be)			(SLAP_DBFLAGS(be) & SLAP_DBFLAG_DISABLED)
 #define SLAP_DB_ONE_SUFFIX(be)		(SLAP_DBFLAGS(be) & SLAP_DBFLAG_ONE_SUFFIX)
 #define SLAP_ISOVERLAY(be)			(SLAP_DBFLAGS(be) & SLAP_DBFLAG_OVERLAY)
 #define SLAP_ISGLOBALOVERLAY(be)		(SLAP_DBFLAGS(be) & SLAP_DBFLAG_GLOBAL_OVERLAY)
@@ -1873,7 +1879,7 @@ struct BackendDB {
 #define SLAP_SYNC_SHADOW(be)			(SLAP_DBFLAGS(be) & SLAP_DBFLAG_SYNC_SHADOW)
 #define SLAP_SLURP_SHADOW(be)			(SLAP_DBFLAGS(be) & SLAP_DBFLAG_SLURP_SHADOW)
 #define SLAP_SINGLE_SHADOW(be)			(SLAP_DBFLAGS(be) & SLAP_DBFLAG_SINGLE_SHADOW)
-#define SLAP_MULTIMASTER(be)			(!SLAP_SINGLE_SHADOW(be))
+#define SLAP_MULTIMASTER(be)			(SLAP_DBFLAGS(be) & SLAP_DBFLAG_MULTI_SHADOW)
 #define SLAP_DBCLEAN(be)			(SLAP_DBFLAGS(be) & SLAP_DBFLAG_CLEAN)
 #define SLAP_DBACL_ADD(be)			(SLAP_DBFLAGS(be) & SLAP_DBFLAG_ACL_ADD)
 #define SLAP_SYNC_SUBENTRY(be)			(SLAP_DBFLAGS(be) & SLAP_DBFLAG_SYNC_SUBENTRY)
@@ -2178,6 +2184,13 @@ typedef int (BI_acl_group) LDAP_P(( Operation *op, Entry *target,
 typedef int (BI_acl_attribute) LDAP_P(( Operation *op, Entry *target,
 	struct berval *entry_ndn, AttributeDescription *entry_at,
 	BerVarray *vals, slap_access_t access ));
+#ifdef LDAP_X_TXN
+struct OpExtra;
+typedef int (BI_op_txn) LDAP_P(( Operation *op, int txnop, struct OpExtra **ptr ));
+#define SLAP_TXN_BEGIN	1
+#define SLAP_TXN_COMMIT	2
+#define SLAP_TXN_ABORT	3
+#endif
 
 typedef int (BI_conn_func) LDAP_P(( BackendDB *bd, Connection *c ));
 typedef BI_conn_func BI_connection_init;
@@ -2195,6 +2208,8 @@ typedef int (BI_tool_entry_reindex) LDAP_P(( BackendDB *be, ID id, AttributeDesc
 typedef int (BI_tool_sync) LDAP_P(( BackendDB *be ));
 typedef ID (BI_tool_dn2id_get) LDAP_P(( BackendDB *be, struct berval *dn ));
 typedef ID (BI_tool_entry_modify) LDAP_P(( BackendDB *be, Entry *e, 
+	struct berval *text ));
+typedef int (BI_tool_entry_delete) LDAP_P(( BackendDB *be, ID id,
 	struct berval *text ));
 
 struct BackendInfo {
@@ -2272,6 +2287,9 @@ struct BackendInfo {
 	BI_operational		*bi_operational;
 	BI_chk_referrals	*bi_chk_referrals;
 	BI_chk_controls		*bi_chk_controls;
+#ifdef LDAP_X_TXN
+	BI_op_txn			*bi_op_txn;
+#endif
 	BI_entry_get_rw		*bi_entry_get_rw;
 	BI_entry_release_rw	*bi_entry_release_rw;
 
@@ -2295,6 +2313,7 @@ struct BackendInfo {
 	BI_tool_sync		*bi_tool_sync;
 	BI_tool_dn2id_get	*bi_tool_dn2id_get;
 	BI_tool_entry_modify	*bi_tool_entry_modify;
+	BI_tool_entry_delete	*bi_tool_entry_delete;
 
 #define SLAP_INDEX_ADD_OP		0x0001
 #define SLAP_INDEX_DELETE_OP	0x0002
@@ -2314,6 +2333,7 @@ struct BackendInfo {
 #define	SLAPO_BFLAG_SINGLE		0x01000000U
 #define	SLAPO_BFLAG_DBONLY		0x02000000U
 #define	SLAPO_BFLAG_GLOBONLY		0x04000000U
+#define	SLAPO_BFLAG_DISABLED		0x08000000U
 #define	SLAPO_BFLAG_MASK		0xFF000000U
 
 #define SLAP_BFLAGS(be)		((be)->bd_info->bi_flags)
@@ -2332,6 +2352,7 @@ struct BackendInfo {
 #define SLAPO_SINGLE(be)	(SLAP_BFLAGS(be) & SLAPO_BFLAG_SINGLE)
 #define SLAPO_DBONLY(be)	(SLAP_BFLAGS(be) & SLAPO_BFLAG_DBONLY)
 #define SLAPO_GLOBONLY(be)	(SLAP_BFLAGS(be) & SLAPO_BFLAG_GLOBONLY)
+#define SLAPO_DISABLED(be)	(SLAP_BFLAGS(be) & SLAPO_BFLAG_DISABLED)
 
 	char	**bi_controls;		/* supported controls */
 	char	bi_ctrls[SLAP_MAX_CIDS + 1];
@@ -2364,10 +2385,14 @@ struct BackendInfo {
 
 typedef int (slap_response)( Operation *, SlapReply * );
 
+struct slap_callback;
+typedef void (slap_writewait)( Operation *, struct slap_callback * );
+
 typedef struct slap_callback {
 	struct slap_callback *sc_next;
 	slap_response *sc_response;
 	slap_response *sc_cleanup;
+	slap_writewait *sc_writewait;
 	void *sc_private;
 } slap_callback;
 
@@ -2388,6 +2413,9 @@ typedef enum slap_operation_e {
 	op_aux_operational,
 	op_aux_chk_referrals,
 	op_aux_chk_controls,
+#ifdef LDAP_X_TXN
+	op_txn,
+#endif
 	op_last
 } slap_operation_t;
 
@@ -2476,6 +2504,9 @@ struct slap_control_ids {
 	int sc_valuesReturnFilter;
 #ifdef SLAP_CONTROL_X_WHATFAILED
 	int sc_whatFailed;
+#endif
+#ifdef LDAP_CONTROL_X_LAZY_COMMIT
+	int sc_lazyCommit;
 #endif
 };
 
@@ -2752,6 +2783,11 @@ struct Operation {
 #define get_whatFailed(op)				_SCM((op)->o_whatFailed)
 #endif
 
+#ifdef SLAP_CONTROL_X_LAZY_COMMIT
+#define o_lazyCommit o_ctrlflag[slap_cids.sc_lazyCommit]
+#define get_lazyCommit(op)				_SCM((op)->o_lazyCommit)
+#endif
+
 #define o_sync			o_ctrlflag[slap_cids.sc_LDAPsync]
 
 	AuthorizationInformation o_authz;
@@ -2902,6 +2938,7 @@ struct Connection {
 	void	*c_sasl_authctx;	/* SASL authentication context */
 	void	*c_sasl_sockctx;	/* SASL security layer context */
 	void	*c_sasl_extra;		/* SASL session extra stuff */
+	void	*c_sasl_cbind;		/* SASL channel binding */
 	Operation	*c_sasl_bindop;	/* set to current op if it's a bind */
 
 #ifdef LDAP_X_TXN
@@ -2985,9 +3022,7 @@ struct Listener {
 	ber_socket_t sl_sd;
 	Sockaddr sl_sa;
 #define sl_addr	sl_sa.sa_in_addr
-#ifdef LDAP_DEVEL
 #define LDAP_TCP_BUFFER
-#endif
 #ifdef LDAP_TCP_BUFFER
 	int	sl_tcp_rmem;	/* custom TCP read buffer size */
 	int	sl_tcp_wmem;	/* custom TCP write buffer size */

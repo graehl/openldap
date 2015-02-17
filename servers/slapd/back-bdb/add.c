@@ -2,7 +2,7 @@
 /* $OpenLDAP$ */
 /* This work is part of OpenLDAP Software <http://www.openldap.org/>.
  *
- * Copyright 2000-2011 The OpenLDAP Foundation.
+ * Copyright 2000-2015 The OpenLDAP Foundation.
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -32,7 +32,7 @@ bdb_add(Operation *op, SlapReply *rs )
 	size_t textlen = sizeof textbuf;
 	AttributeDescription *children = slap_schema.si_ad_children;
 	AttributeDescription *entry = slap_schema.si_ad_entry;
-	DB_TXN		*ltid = NULL, *lt2, *rtxn;
+	DB_TXN		*ltid = NULL, *lt2;
 	ID eid = NOID;
 	struct bdb_op_info opinfo = {{{ 0 }}};
 	int subentry;
@@ -45,49 +45,12 @@ bdb_add(Operation *op, SlapReply *rs )
 	LDAPControl *ctrls[SLAP_MAX_RESPONSE_CONTROLS];
 	int num_ctrls = 0;
 
-#ifdef LDAP_X_TXN
-	int settle = 0;
-#endif
-
 	Debug(LDAP_DEBUG_ARGS, "==> " LDAP_XSTRING(bdb_add) ": %s\n",
 		op->ora_e->e_name.bv_val, 0, 0);
 
 #ifdef LDAP_X_TXN
-	if( op->o_txnSpec ) {
-		/* acquire connection lock */
-		ldap_pvt_thread_mutex_lock( &op->o_conn->c_mutex );
-		if( op->o_conn->c_txn == CONN_TXN_INACTIVE ) {
-			rs->sr_text = "invalid transaction identifier";
-			rs->sr_err = LDAP_X_TXN_ID_INVALID;
-			goto txnReturn;
-		} else if( op->o_conn->c_txn == CONN_TXN_SETTLE ) {
-			settle=1;
-			goto txnReturn;
-		}
-
-		if( op->o_conn->c_txn_backend == NULL ) {
-			op->o_conn->c_txn_backend = op->o_bd;
-
-		} else if( op->o_conn->c_txn_backend != op->o_bd ) {
-			rs->sr_text = "transaction cannot span multiple database contexts";
-			rs->sr_err = LDAP_AFFECTS_MULTIPLE_DSAS;
-			goto txnReturn;
-		}
-
-		/* insert operation into transaction */
-
-		rs->sr_text = "transaction specified";
-		rs->sr_err = LDAP_X_TXN_SPECIFY_OKAY;
-
-txnReturn:
-		/* release connection lock */
-		ldap_pvt_thread_mutex_unlock( &op->o_conn->c_mutex );
-
-		if( !settle ) {
-			send_ldap_result( op, rs );
-			return rs->sr_err;
-		}
-	}
+	if( op->o_txnSpec && txn_preop( op, rs ))
+		return rs->sr_err;
 #endif
 
 	ctrls[num_ctrls] = 0;
@@ -121,9 +84,6 @@ txnReturn:
 
 	subentry = is_entry_subentry( op->ora_e );
 
-	/* Get our reader TXN */
-	rs->sr_err = bdb_reader_get( op, bdb->bi_dbenv, &rtxn );
-
 	if( 0 ) {
 retry:	/* transaction retry */
 		if( p ) {
@@ -151,8 +111,12 @@ retry:	/* transaction retry */
 	}
 
 	/* begin transaction */
-	rs->sr_err = TXN_BEGIN( bdb->bi_dbenv, NULL, &ltid, 
-		bdb->bi_db_opflags );
+	{
+		int tflags = bdb->bi_db_opflags;
+		if ( get_lazyCommit( op ))
+			tflags |= DB_TXN_NOSYNC;
+		rs->sr_err = TXN_BEGIN( bdb->bi_dbenv, NULL, &ltid, tflags );
+	}
 	rs->sr_text = NULL;
 	if( rs->sr_err != 0 ) {
 		Debug( LDAP_DEBUG_TRACE,
@@ -162,6 +126,8 @@ retry:	/* transaction retry */
 		rs->sr_text = "internal error";
 		goto return_results;
 	}
+	Debug( LDAP_DEBUG_TRACE, LDAP_XSTRING(bdb_add) ": txn1 id: %x\n",
+		ltid->id(ltid), 0, 0 );
 
 	opinfo.boi_oe.oe_key = bdb;
 	opinfo.boi_txn = ltid;
@@ -379,6 +345,8 @@ retry:	/* transaction retry */
 		rs->sr_text = "internal error";
 		goto return_results;
 	}
+	Debug( LDAP_DEBUG_TRACE, LDAP_XSTRING(bdb_add) ": txn2 id: %x\n",
+		lt2->id(lt2), 0, 0 );
 
 	/* dn2id index */
 	rs->sr_err = bdb_dn2id_add( op, lt2, ei, op->ora_e );
@@ -480,8 +448,7 @@ retry:	/* transaction retry */
 			nrdn = op->ora_e->e_nname;
 		}
 
-		/* Use the reader txn here, outside the add txn */
-		bdb_cache_add( bdb, ei, op->ora_e, &nrdn, rtxn, &lock );
+		bdb_cache_add( bdb, ei, op->ora_e, &nrdn, ltid, &lock );
 
 		if(( rs->sr_err=TXN_COMMIT( ltid, 0 )) != 0 ) {
 			rs->sr_text = "txn_commit failed";
@@ -527,7 +494,7 @@ return_results:
 		 * Possibly a callback may have mucked with it, although
 		 * in general callbacks should treat the entry as read-only.
 		 */
-		bdb_cache_return_entry_r( bdb, oe, &lock );
+		bdb_cache_deref( oe->e_private );
 		if ( op->ora_e == oe )
 			op->ora_e = NULL;
 

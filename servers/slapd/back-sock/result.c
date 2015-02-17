@@ -2,7 +2,7 @@
 /* $OpenLDAP$ */
 /* This work is part of OpenLDAP Software <http://www.openldap.org/>.
  *
- * Copyright 2007-2011 The OpenLDAP Foundation.
+ * Copyright 2007-2015 The OpenLDAP Foundation.
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -48,6 +48,7 @@ sock_read_and_send_results(
 	char	line[BUFSIZ];
 	char	ebuf[128];
 
+	(void) fflush(fp);
 	/* read in the result and send it along */
 	buf = (char *) ch_malloc( BUFSIZ );
 	buf[0] = '\0';
@@ -74,6 +75,14 @@ sock_read_and_send_results(
 		/* ignore lines beginning with DEBUG: */
 		if ( strncasecmp( line, "DEBUG:", 6 ) == 0 ) {
 			continue;
+		}
+
+		if ( strncasecmp( line, "CONTINUE", 8 ) == 0 ) {
+			struct sockinfo	*si = (struct sockinfo *) op->o_bd->be_private;
+			/* Only valid when operating as an overlay! */
+			assert( si->si_ops != 0 );
+			rs->sr_err = SLAP_CB_CONTINUE;
+			goto skip;
 		}
 
 		len = strlen( line );
@@ -113,7 +122,8 @@ sock_read_and_send_results(
 		send_ldap_result( op, rs );
 	}
 
-	free( buf );
+skip:
+	ch_free( buf );
 
 	return( rs->sr_err );
 }
@@ -150,5 +160,8 @@ sock_print_conn(
 	}
 	if( si->si_extensions & SOCK_EXT_SSF ) {
 		fprintf( fp, "ssf: %d\n", conn->c_ssf );
+	}
+	if( si->si_extensions & SOCK_EXT_CONNID ) {
+		fprintf( fp, "connid: %lu\n", conn->c_connid );
 	}
 }

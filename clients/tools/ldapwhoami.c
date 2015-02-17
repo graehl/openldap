@@ -2,7 +2,7 @@
 /* $OpenLDAP$ */
 /* This work is part of OpenLDAP Software <http://www.openldap.org/>.
  *
- * Copyright 1998-2011 The OpenLDAP Foundation.
+ * Copyright 1998-2015 The OpenLDAP Foundation.
  * Portions Copyright 1998-2003 Kurt D. Zeilenga.
  * Portions Copyright 1998-2001 Net Boolean Incorporated.
  * Portions Copyright 2001-2003 IBM Corporation.
@@ -113,7 +113,7 @@ main( int argc, char *argv[] )
 	char		*matcheddn = NULL, *text = NULL, **refs = NULL;
 	struct berval	*authzid = NULL;
 	int		id, code = 0;
-	LDAPMessage	*res;
+	LDAPMessage	*res = NULL;
 	LDAPControl	**ctrls = NULL;
 
 	tool_init( TOOL_WHOAMI );
@@ -151,7 +151,7 @@ main( int argc, char *argv[] )
 		struct timeval	tv;
 
 		if ( tool_check_abandon( ld, id ) ) {
-			return LDAP_CANCELLED;
+			tool_exit( ld, LDAP_CANCELLED );
 		}
 
 		tv.tv_sec = 0;
@@ -160,7 +160,7 @@ main( int argc, char *argv[] )
 		rc = ldap_result( ld, LDAP_RES_ANY, LDAP_MSG_ALL, &tv, &res );
 		if ( rc < 0 ) {
 			tool_perror( "ldap_result", rc, NULL, NULL, NULL, NULL );
-			return rc;
+			tool_exit( ld, rc );
 		}
 
 		if ( rc != 0 ) {
@@ -199,8 +199,8 @@ main( int argc, char *argv[] )
 
 skip:
 	ldap_msgfree(res);
-	if ( verbose || ( code != LDAP_SUCCESS ) ||
-		matcheddn || text || refs || ctrls )
+	if ( verbose || code != LDAP_SUCCESS ||
+		( matcheddn && *matcheddn ) || ( text && *text ) || refs || ctrls )
 	{
 		printf( _("Result: %s (%d)\n"), ldap_err2string( code ), code );
 
@@ -231,8 +231,5 @@ skip:
 	ber_bvfree( authzid );
 
 	/* disconnect from server */
-	tool_unbind( ld );
-	tool_destroy();
-
-	return code == LDAP_SUCCESS ? EXIT_SUCCESS : EXIT_FAILURE;
+	tool_exit( ld, code == LDAP_SUCCESS ? EXIT_SUCCESS : EXIT_FAILURE );
 }

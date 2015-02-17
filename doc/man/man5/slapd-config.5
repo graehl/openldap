@@ -1,5 +1,5 @@
 .TH SLAPD-CONFIG 5 "RELEASEDATE" "OpenLDAP LDVERSION"
-.\" Copyright 1998-2011 The OpenLDAP Foundation All Rights Reserved.
+.\" Copyright 1998-2015 The OpenLDAP Foundation All Rights Reserved.
 .\" Copying restrictions apply.  See COPYRIGHT/LICENSE.
 .\" $OpenLDAP$
 .SH NAME
@@ -446,20 +446,6 @@ upon StartTLS operation receipt.
 disallows the StartTLS operation if authenticated (see also
 .BR tls_2_anon ).
 .TP
-.B olcExtraAttrs: <attr>
-Lists what attributes need to be added to search requests.
-Local storage backends return the entire entry to the frontend.
-The frontend takes care of only returning the requested attributes
-that are allowed by ACLs.
-However, features like access checking and so may need specific
-attributes that are not automatically returned by remote storage
-backends, like proxy backends and so on.
-.B <attr>
-is an attribute that is needed for internal purposes
-and thus always needs to be collected, even when not explicitly
-requested by clients.
-This attribute is multi-valued.
-.TP
 .B olcGentleHUP: { TRUE | FALSE }
 A SIGHUP signal will only cause a 'gentle' shutdown-attempt:
 .B Slapd
@@ -483,6 +469,16 @@ an idle client connection.  A setting of 0 disables this
 feature.  The default is 0. You may also want to set the
 .B olcWriteTimeout
 option.
+.TP
+.B olcIndexHash64: { on | off }
+Use a 64 bit hash for indexing. The default is to use 32 bit hashes.
+These hashes are used for equality and substring indexing. The 64 bit
+version may be needed to avoid index collisions when the number of
+indexed values exceeds ~64 million. (Note that substring indexing
+generates multiple index values per actual attribute value.)
+Indices generated with 32 bit hashes are incompatible with the 64 bit
+version, and vice versa. Any existing databases must be fully reloaded
+when changing this setting. This directive is only supported on 64 bit CPUs.
 .TP
 .B olcIndexIntLen: <integer>
 Specify the key length for ordered integer indices. The most significant
@@ -817,7 +813,8 @@ you can specify.
 .TP
 .B olcTLSCipherSuite: <cipher-suite-spec>
 Permits configuring what ciphers will be accepted and the preference order.
-<cipher-suite-spec> should be a cipher specification for OpenSSL resp. GNUtls.
+<cipher-suite-spec> should be a cipher specification for
+the TLS library in use (OpenSSL, GnuTLS, or Mozilla NSS).
 Example:
 .RS
 .RS
@@ -825,7 +822,7 @@ Example:
 .I OpenSSL:
 olcTLSCipherSuite: HIGH:MEDIUM:+SSLv2
 .TP
-.I GNUtls:
+.I GnuTLS:
 TLSCiphersuite SECURE256:!AES-128-CBC
 .RE
 
@@ -835,17 +832,25 @@ To check what ciphers a given spec selects in OpenSSL, use:
 	openssl ciphers \-v <cipher-suite-spec>
 .fi
 
-With GNUtls the available specs can be found in the manual page of
+With GnuTLS the available specs can be found in the manual page of
 .BR gnutls\-cli (1)
 (see the description of the
 option
 .BR \-\-priority ).
 
-In older versions of GNUtls, where gnutls\-cli does not support the option
+In older versions of GnuTLS, where gnutls\-cli does not support the option
 \-\-priority, you can obtain the \(em more limited \(em list of ciphers by calling:
 
 .nf
 	gnutls\-cli \-l
+.fi
+
+When using Mozilla NSS, the OpenSSL cipher suite specifications are used and
+translated into the format used internally by Mozilla NSS.  There isn't an easy
+way to list the cipher suites from the command line.  The authoritative list
+is in the source code for Mozilla NSS in the file sslinfo.c in the structure
+.nf
+        static const SSLCipherSuiteInfo suiteInfo[]
 .fi
 .RE
 .TP
@@ -860,12 +865,33 @@ Specifies the path of a directory that contains Certificate Authority
 certificates in separate individual files. Usually only one of this
 or the olcTLSCACertificateFile is defined. If both are specified, both
 locations will be used. This directive is not supported
-when using GNUtls.
+when using GnuTLS.
+
+When using Mozilla NSS, <path> may contain a Mozilla NSS cert/key
+database.  If <path> contains a Mozilla NSS cert/key database and
+CA cert files, OpenLDAP will use the cert/key database and will
+ignore the CA cert files.
 .TP
 .B olcTLSCertificateFile: <filename>
 Specifies the file that contains the
 .B slapd
 server certificate.
+
+When using Mozilla NSS, if using a cert/key database (specified with
+olcTLSCACertificatePath), olcTLSCertificateFile specifies
+the name of the certificate to use:
+.nf
+	olcTLSCertificateFile: Server-Cert
+.fi
+If using a token other than the internal built in token, specify the
+token name first, followed by a colon:
+.nf
+	olcTLSCertificateFile: my hardware device:Server-Cert
+.fi
+Use certutil -L to list the certificates by name:
+.nf
+	certutil -d /path/to/certdbdir -L
+.fi
 .TP
 .B olcTLSCertificateKeyFile: <filename>
 Specifies the file that contains the
@@ -877,23 +903,63 @@ be manually typed in when slapd starts.  Usually the private key is not
 protected with a password, to allow slapd to start without manual
 intervention, so
 it is of critical importance that the file is protected carefully. 
+
+When using Mozilla NSS, olcTLSCertificateKeyFile specifies the name of
+a file that contains the password for the key for the certificate specified with
+olcTLSCertificateFile.  The modutil command can be used to turn off password
+protection for the cert/key database.  For example, if olcTLSCACertificatePath
+specifes /etc/openldap/certdb as the location of the cert/key database, use
+modutil to change the password to the empty string:
+.nf
+	modutil -dbdir /etc/openldap/certdb -changepw 'NSS Certificate DB'
+.fi
+You must have the old password, if any.  Ignore the WARNING about the running
+browser.  Press 'Enter' for the new password.
+
 .TP
 .B olcTLSDHParamFile: <filename>
 This directive specifies the file that contains parameters for Diffie-Hellman
 ephemeral key exchange.  This is required in order to use a DSA certificate on
-the server. If multiple sets of parameters are present in the file, all of
-them will be processed.  Note that setting this option may also enable
+the server, or an RSA certificate missing the "key encipherment" key usage.
+Note that setting this option may also enable
 Anonymous Diffie-Hellman key exchanges in certain non-default cipher suites.
-You should append "!ADH" to your cipher suites if you have changed them
-from the default, otherwise no certificate exchanges or verification will
-be done. When using GNUtls these parameters are always generated randomly
+Anonymous key exchanges should generally be avoided since they provide no
+actual client or server authentication and provide no protection against
+man-in-the-middle attacks.
+You should append "!ADH" to your cipher suites to ensure that these suites
+are not used.
+When using Mozilla NSS these parameters are always generated randomly
 so this directive is ignored.
+.TP
+.B olcTLSECName: <name>
+Specify the name of a curve to use for Elliptic curve Diffie-Hellman
+ephemeral key exchange.  This is required to enable ECDHE algorithms in
+OpenSSL.  This option is not used with GnuTLS; the curves may be
+chosen in the GnuTLS ciphersuite specification. This option is also
+ignored for Mozilla NSS.
+.TP
+.B olcTLSProtocolMin: <major>[.<minor>]
+Specifies minimum SSL/TLS protocol version that will be negotiated.
+If the server doesn't support at least that version,
+the SSL handshake will fail.
+To require TLS 1.x or higher, set this option to 3.(x+1),
+e.g.,
+
+.nf
+	olcTLSProtocolMin: 3.2
+.fi
+
+would require TLS 1.1.
+Specifying a minimum that is higher than that supported by the
+OpenLDAP implementation will result in it requiring the
+highest level that it does support.
+This directive is ignored with GnuTLS.
 .TP
 .B olcTLSRandFile: <filename>
 Specifies the file to obtain random bits from when /dev/[u]random
 is not available.  Generally set to the name of the EGD/PRNGD socket.
 The environment variable RANDFILE can also be used to specify the filename.
-This directive is ignored with GNUtls.
+This directive is ignored with GnuTLS and Mozilla NSS.
 .TP
 .B olcTLSVerifyClient: <level>
 Specifies what checks to perform on client certificates in an
@@ -935,7 +1001,7 @@ Specifies if the Certificate Revocation List (CRL) of the CA should be
 used to verify if the client certificates have not been revoked. This
 requires
 .B olcTLSCACertificatePath
-parameter to be set. This parameter is ignored with GNUtls.
+parameter to be set. This parameter is ignored with GnuTLS and Mozilla NSS.
 .B <level>
 can be specified as one of the following keywords:
 .RS
@@ -953,7 +1019,7 @@ Check the CRL for a whole certificate chain
 .B olcTLSCRLFile: <filename>
 Specifies a file containing a Certificate Revocation List to be used
 for verifying that certificates have not been revoked. This parameter
-is only valid when using GNUtls.
+is only valid when using GnuTLS or Mozilla NSS.
 .SH DYNAMIC MODULE OPTIONS
 If
 .B slapd
@@ -1059,7 +1125,8 @@ value "oid.xx" will be used.
 
 .SH GENERAL BACKEND OPTIONS
 Options in these entries only apply to the configuration of a single
-type of backend. All backends may support this class of options.
+type of backend. All backends may support this class of options, but
+currently none do.
 The entry must be named
 .B olcBackend=<databasetype>,cn=config
 and must have the olcBackendConfig objectClass.
@@ -1071,8 +1138,10 @@ should be one of
 .BR hdb ,
 .BR ldap ,
 .BR ldif ,
+.BR mdb ,
 .BR meta ,
 .BR monitor ,
+.BR ndb ,
 .BR null ,
 .BR passwd ,
 .BR perl ,
@@ -1080,7 +1149,8 @@ should be one of
 .BR shell ,
 or
 .BR sql .
-At present, no backend implements any options of this type.
+At present, no backend implements any options of this type, so this
+entry should not be used.
 
 .SH DATABASE OPTIONS
 Database options are set in entries named
@@ -1128,6 +1198,20 @@ Specify a default search base to use when client submits a
 non-base search request with an empty base DN.
 Base scoped search requests with an empty base DN are not affected.
 This setting is only allowed in the frontend entry.
+.TP
+.B olcExtraAttrs: <attr>
+Lists what attributes need to be added to search requests.
+Local storage backends return the entire entry to the frontend.
+The frontend takes care of only returning the requested attributes
+that are allowed by ACLs.
+However, features like access checking and so may need specific
+attributes that are not automatically returned by remote storage
+backends, like proxy backends and so on.
+.B <attr>
+is an attribute that is needed for internal purposes
+and thus always needs to be collected, even when not explicitly
+requested by clients.
+This attribute is multi-valued.
 .TP
 .B olcPasswordHash: <hash> [<hash>...]
 This option configures one or more hashes to be used in generation of user
@@ -1712,6 +1796,7 @@ FALSE, meaning the contextCSN is stored in the context entry.
 .B [tls_reqcert=never|allow|try|demand]
 .B [tls_ciphersuite=<ciphers>]
 .B [tls_crlcheck=none|peer|all]
+.B [tls_protocol_min=<major>[.<minor>]]
 .B [suffixmassage=<real DN>]
 .B [logbase=<base DN>]
 .B [logfilter=<filter str>]
@@ -1955,7 +2040,7 @@ dn: cn=schema,cn=config
 objectClass: olcSchemaConfig
 cn: schema
 
-include: SYSCONFDIR/schema/core.ldif
+include: file://SYSCONFDIR/schema/core.ldif
 
 dn: olcDatabase=frontend,cn=config
 objectClass: olcDatabaseConfig
@@ -2039,7 +2124,6 @@ default slapd configuration directory
 .BR slapd.conf (5),
 .BR slapd.overlays (5),
 .BR slapd.plugin (5),
-.BR slapd.replog (5),
 .BR slapd (8),
 .BR slapacl (8),
 .BR slapadd (8),

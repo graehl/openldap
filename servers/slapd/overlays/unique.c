@@ -2,7 +2,7 @@
 /* $OpenLDAP$ */
 /* This work is part of OpenLDAP Software <http://www.openldap.org/>.
  *
- * Copyright 2004-2011 The OpenLDAP Foundation.
+ * Copyright 2004-2015 The OpenLDAP Foundation.
  * Portions Copyright 2004,2006-2007 Symas Corporation.
  * All rights reserved.
  *
@@ -17,7 +17,7 @@
 /* ACKNOWLEDGEMENTS: 
  * This work was initially developed by Symas Corporation for
  * inclusion in OpenLDAP Software, with subsequent enhancements by
- * Matthew Backes at Symas Corporation.  This work was sponsored by
+ * Emily Backes at Symas Corporation.  This work was sponsored by
  * Hewlett-Packard.
  */
 
@@ -183,6 +183,14 @@ unique_new_domain_uri ( unique_domain_uri **urip,
 	const char * text;
 
 	uri = ch_calloc ( 1, sizeof ( unique_domain_uri ) );
+
+	if ( url_desc->lud_host && url_desc->lud_host[0] ) {
+		snprintf( c->cr_msg, sizeof( c->cr_msg ),
+			  "host <%s> not allowed in URI",
+			  url_desc->lud_host );
+		rc = ARG_BAD_CONF;
+		goto exit;
+	}
 
 	if ( url_desc->lud_dn && url_desc->lud_dn[0] ) {
 		ber_str2bv( url_desc->lud_dn, 0, 0, &bv );
@@ -815,47 +823,6 @@ unique_db_destroy(
 	return 0;
 }
 
-static int
-unique_open(
-	BackendDB *be,
-	ConfigReply *cr
-)
-{
-	Debug(LDAP_DEBUG_TRACE, "unique_open: overlay initialized\n", 0, 0, 0);
-
-	return 0;
-}
-
-
-/*
-** Leave unique_data but wipe out config
-**
-*/
-
-static int
-unique_close(
-	BackendDB *be,
-	ConfigReply *cr
-)
-{
-	slap_overinst *on	= (slap_overinst *) be->bd_info;
-	unique_data **privatep = (unique_data **) &on->on_bi.bi_private;
-	unique_data *private = *privatep;
-
-	Debug(LDAP_DEBUG_TRACE, "==> unique_close\n", 0, 0, 0);
-
-	if ( private ) {
-		unique_domain *domains = private->domains;
-		unique_domain *legacy = private->legacy;
-
-		unique_free_domain ( domains );
-		unique_free_domain ( legacy );
-		memset ( private, 0, sizeof ( unique_data ) );
-	}
-
-	return ( 0 );
-}
-
 
 /*
 ** search callback
@@ -963,6 +930,8 @@ build_filter(
 				int len;
 
 				ldap_bv2escaped_filter_value_x( &b[i], &bv, 1, ctx );
+				if (!b[i].bv_len)
+					bv.bv_val = b[i].bv_val;
 				len = snprintf( kp, ks, "(%s=%s)", ad->ad_cname.bv_val, bv.bv_val );
 				assert( len >= 0 && len < ks );
 				kp += len;
@@ -1068,6 +1037,16 @@ unique_add(
 
 	Debug(LDAP_DEBUG_TRACE, "==> unique_add <%s>\n",
 	      op->o_req_dn.bv_val, 0, 0);
+
+	/* skip the checks if the operation has manageDsaIt control in it
+	 * (for replication) */
+	if ( op->o_managedsait > SLAP_CONTROL_IGNORED
+	     && access_allowed ( op, op->ora_e,
+				 slap_schema.si_ad_entry, NULL,
+				 ACL_MANAGE, NULL ) ) {
+		Debug(LDAP_DEBUG_TRACE, "unique_add: administrative bypass, skipping\n", 0, 0, 0);
+		return rc;
+	}
 
 	for ( domain = legacy ? legacy : domains;
 	      domain;
@@ -1190,6 +1169,16 @@ unique_modify(
 	Debug(LDAP_DEBUG_TRACE, "==> unique_modify <%s>\n",
 	      op->o_req_dn.bv_val, 0, 0);
 
+	/* skip the checks if the operation has manageDsaIt control in it
+	 * (for replication) */
+	if ( op->o_managedsait > SLAP_CONTROL_IGNORED
+	     && access_allowed ( op, op->ora_e,
+				 slap_schema.si_ad_entry, NULL,
+				 ACL_MANAGE, NULL ) ) {
+		Debug(LDAP_DEBUG_TRACE, "unique_modify: administrative bypass, skipping\n", 0, 0, 0);
+		return rc;
+	}
+
 	for ( domain = legacy ? legacy : domains;
 	      domain;
 	      domain = domain->next )
@@ -1303,6 +1292,16 @@ unique_modrdn(
 
 	Debug(LDAP_DEBUG_TRACE, "==> unique_modrdn <%s> <%s>\n",
 		op->o_req_dn.bv_val, op->orr_newrdn.bv_val, 0);
+
+	/* skip the checks if the operation has manageDsaIt control in it
+	 * (for replication) */
+	if ( op->o_managedsait > SLAP_CONTROL_IGNORED
+	     && access_allowed ( op, op->ora_e,
+				 slap_schema.si_ad_entry, NULL,
+				 ACL_MANAGE, NULL ) ) {
+		Debug(LDAP_DEBUG_TRACE, "unique_modrdn: administrative bypass, skipping\n", 0, 0, 0);
+		return rc;
+	}
 
 	for ( domain = legacy ? legacy : domains;
 	      domain;
@@ -1434,8 +1433,6 @@ unique_initialize()
 	unique.on_bi.bi_type = "unique";
 	unique.on_bi.bi_db_init = unique_db_init;
 	unique.on_bi.bi_db_destroy = unique_db_destroy;
-	unique.on_bi.bi_db_open = unique_open;
-	unique.on_bi.bi_db_close = unique_close;
 	unique.on_bi.bi_op_add = unique_add;
 	unique.on_bi.bi_op_modify = unique_modify;
 	unique.on_bi.bi_op_modrdn = unique_modrdn;

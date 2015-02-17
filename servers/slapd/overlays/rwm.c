@@ -2,7 +2,7 @@
 /* $OpenLDAP$ */
 /* This work is part of OpenLDAP Software <http://www.openldap.org/>.
  *
- * Copyright 2003-2011 The OpenLDAP Foundation.
+ * Copyright 2003-2015 The OpenLDAP Foundation.
  * Portions Copyright 2003 Pierangelo Masarati.
  * All rights reserved.
  *
@@ -107,10 +107,12 @@ rwm_op_rollback( Operation *op, SlapReply *rs, rwm_op_state *ros )
 		break;
 	case LDAP_REQ_MODRDN:
 		if ( op->orr_newSup != ros->orr_newSup ) {
-			ch_free( op->orr_newSup->bv_val );
-			ch_free( op->orr_nnewSup->bv_val );
-			op->o_tmpfree( op->orr_newSup, op->o_tmpmemctx );
-			op->o_tmpfree( op->orr_nnewSup, op->o_tmpmemctx );
+			if ( op->orr_newSup ) {
+				ch_free( op->orr_newSup->bv_val );
+				ch_free( op->orr_nnewSup->bv_val );
+				op->o_tmpfree( op->orr_newSup, op->o_tmpmemctx );
+				op->o_tmpfree( op->orr_nnewSup, op->o_tmpmemctx );
+			}
 			op->orr_newSup = ros->orr_newSup;
 			op->orr_nnewSup = ros->orr_nnewSup;
 		}
@@ -176,7 +178,7 @@ rwm_callback_get( Operation *op )
 {
 	rwm_op_cb	*roc;
 
-	roc = op->o_tmpalloc( sizeof( struct rwm_op_cb ), op->o_tmpmemctx );
+	roc = op->o_tmpcalloc( 1, sizeof( struct rwm_op_cb ), op->o_tmpmemctx );
 	roc->cb.sc_cleanup = rwm_op_cleanup;
 	roc->cb.sc_response = NULL;
 	roc->cb.sc_next = op->o_callback;
@@ -1154,7 +1156,7 @@ rwm_extended( Operation *op, SlapReply *rs )
 	return SLAP_CB_CONTINUE;
 }
 
-static int
+static void
 rwm_matched( Operation *op, SlapReply *rs )
 {
 	slap_overinst		*on = (slap_overinst *) op->o_bd->bd_info;
@@ -1166,7 +1168,7 @@ rwm_matched( Operation *op, SlapReply *rs )
 	int			rc;
 
 	if ( rs->sr_matched == NULL ) {
-		return SLAP_CB_CONTINUE;
+		return;
 	}
 
 	dc.rwmap = rwmap;
@@ -1179,10 +1181,8 @@ rwm_matched( Operation *op, SlapReply *rs )
 	if ( rc != LDAP_SUCCESS ) {
 		rs->sr_err = rc;
 		rs->sr_text = "Rewrite error";
-		return 1;
-	}
 
-	if ( mdn.bv_val != dn.bv_val ) {
+	} else if ( mdn.bv_val != dn.bv_val ) {
 		if ( rs->sr_flags & REP_MATCHED_MUSTBEFREED ) {
 			ch_free( (void *)rs->sr_matched );
 
@@ -1191,8 +1191,6 @@ rwm_matched( Operation *op, SlapReply *rs )
 		}
 		rs->sr_matched = mdn.bv_val;
 	}
-	
-	return SLAP_CB_CONTINUE;
 }
 
 static int
@@ -1281,7 +1279,13 @@ rwm_attrs( Operation *op, SlapReply *rs, Attribute** a_first, int stripEntryDN )
 								NULL );
 
 							if ( rc != LDAP_SUCCESS ) {
-								BER_BVZERO( &(*ap)->a_nvals[i] );
+								/* FIXME: this is wrong, putting a non-normalized value
+								 * into nvals. But when a proxy sends us bogus data,
+								 * we still need to give it to the client, even if it
+								 * violates the syntax. I.e., we don't want to silently
+								 * drop things and trigger an apparent data loss.
+								 */
+								ber_dupbv( &(*ap)->a_nvals[i], &(*ap)->a_vals[i] );
 							}
 						}
 						BER_BVZERO( &(*ap)->a_nvals[i] );
@@ -1761,20 +1765,18 @@ rwm_response( Operation *op, SlapReply *rs )
 			dc.rs = NULL; 
 			dc.ctx = "referralDN";
 			rc = rwm_referral_result_rewrite( &dc, rs->sr_ref );
+			/* FIXME: impossible, so far */
 			if ( rc != LDAP_SUCCESS ) {
-				rc = 1;
+				rs->sr_err = rc;
 				break;
 			}
 		}
-		rc = rwm_matched( op, rs );
-		break;
 
-	default:
-		rc = SLAP_CB_CONTINUE;
+		rwm_matched( op, rs );
 		break;
 	}
 
-	return rc;
+	return SLAP_CB_CONTINUE;
 }
 
 static int

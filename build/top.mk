@@ -1,7 +1,7 @@
 # $OpenLDAP$
 ## This work is part of OpenLDAP Software <http://www.openldap.org/>.
 ##
-## Copyright 1998-2011 The OpenLDAP Foundation.
+## Copyright 1998-2015 The OpenLDAP Foundation.
 ## All rights reserved.
 ##
 ## Redistribution and use in source and binary forms, with or without
@@ -170,12 +170,10 @@ LDAP_LIBREWRITE_A = $(LDAP_LIBDIR)/librewrite/librewrite.a
 LDAP_LIBLUNICODE_A = $(LDAP_LIBDIR)/liblunicode/liblunicode.a
 LDAP_LIBLUTIL_A = $(LDAP_LIBDIR)/liblutil/liblutil.a
 
-LDAP_L = \
-	$(LDAP_LIBLDAP_LA) $(LDAP_LIBLBER_LA) \
-	$(LDAP_LIBLUTIL_A)
+LDAP_L = $(LDAP_LIBLUTIL_A) \
+	$(LDAP_LIBLDAP_LA) $(LDAP_LIBLBER_LA)
 SLAPD_L = $(LDAP_LIBLUNICODE_A) $(LDAP_LIBREWRITE_A) \
-	$(LDAP_LIBLDAP_R_LA) $(LDAP_LIBLBER_LA) \
-	$(LDAP_LIBLUTIL_A)
+	$(LDAP_LIBLUTIL_A) $(LDAP_LIBLDAP_R_LA) $(LDAP_LIBLBER_LA)
 
 WRAP_LIBS = @WRAP_LIBS@
 # AutoConfig generated 

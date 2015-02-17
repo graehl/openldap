@@ -2,7 +2,7 @@
 /* $OpenLDAP$ */
 /* This work is part of OpenLDAP Software <http://www.openldap.org/>.
  *
- * Copyright 1998-2011 The OpenLDAP Foundation.
+ * Copyright 1998-2015 The OpenLDAP Foundation.
  * Portions Copyright 2010 Kurt D. Zeilenga.
  * All rights reserved.
  *
@@ -255,6 +255,8 @@ handle_private_option( int i )
 		    fprintf( stderr, _("Invalid Verify Credentials extension name: %s\n"), control );
 		    usage();
 		}
+		free( control );
+		break;
 
 	case 'a':  /* request authzid */
 		req_authzid++;
@@ -382,7 +384,7 @@ main( int argc, char *argv[] )
 				ldap_get_option(ld, LDAP_OPT_DIAGNOSTIC_MESSAGE, (void*) &text);
 				tool_perror( "ldap_verify_credentials_interactive", rc, NULL, NULL, text, NULL);
 				ldap_memfree(text);
-				exit(rc);
+				tool_exit(ld, rc);
 			}
 		} while (rc == LDAP_SASL_BIND_IN_PROGRESS);
 
@@ -415,7 +417,7 @@ main( int argc, char *argv[] )
 		    struct timeval	tv;
 
 		    if ( tool_check_abandon( ld, id ) ) {
-			    return LDAP_CANCELLED;
+			    tool_exit( ld, LDAP_CANCELLED );
 		    }
 
 		    tv.tv_sec = 0;
@@ -424,7 +426,7 @@ main( int argc, char *argv[] )
 		    rc = ldap_result( ld, LDAP_RES_ANY, LDAP_MSG_ALL, &tv, &res );
 		    if ( rc < 0 ) {
 			    tool_perror( "ldap_result", rc, NULL, NULL, NULL, NULL );
-			    return rc;
+			    tool_exit( ld, rc );
 		    }
 
 		    if ( rc != 0 ) {
@@ -469,8 +471,8 @@ main( int argc, char *argv[] )
 	}
 
 skip:
-	if ( verbose || ( code != LDAP_SUCCESS ) ||
-		matcheddn || text || refs || ctrls )
+	if ( verbose || code != LDAP_SUCCESS ||
+		( matcheddn && *matcheddn ) || ( text && *text ) || refs || ctrls )
 	{
 		printf( _("Result: %s (%d)\n"), ldap_err2string( code ), code );
 
@@ -504,8 +506,5 @@ skip:
 	free( cred.bv_val );
 
 	/* disconnect from server */
-	tool_unbind( ld );
-	tool_destroy();
-
-	return code == LDAP_SUCCESS ? EXIT_SUCCESS : EXIT_FAILURE;
+	tool_exit( ld, code == LDAP_SUCCESS ? EXIT_SUCCESS : EXIT_FAILURE );
 }

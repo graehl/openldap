@@ -2,7 +2,7 @@
 /* $OpenLDAP$ */
 /* This work is part of OpenLDAP Software <http://www.openldap.org/>.
  *
- * Copyright 2010-2011 The OpenLDAP Foundation.
+ * Copyright 2010-2015 The OpenLDAP Foundation.
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -130,11 +130,13 @@ vc_create_response(
 		if ( rc == -1 ) goto done;
 	}
 
-	ber_printf( ber, /*{*/ "}" );
+	rc = ber_printf( ber, /*{*/ "}" );
+	if ( rc == -1 ) goto done;
 
 	rc = ber_flatten2( ber, &bv, 0 );
-
-	*val = ber_bvdup( &bv );
+	if ( rc == 0 ) {
+		*val = ber_bvdup( &bv );
+	}
 
 done:;
 	ber_free_buf( ber );

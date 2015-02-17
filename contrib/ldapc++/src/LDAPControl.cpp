@@ -1,6 +1,6 @@
 // $OpenLDAP$
 /*
- * Copyright 2000, OpenLDAP Foundation, All Rights Reserved.
+ * Copyright 2000-2015 The OpenLDAP Foundation, All Rights Reserved.
  * COPYING RESTRICTIONS APPLY, see COPYRIGHT file
  */
 
@@ -19,6 +19,7 @@ LDAPCtrl::LDAPCtrl(const char *oid, bool critical, const char* data,
     m_isCritical=critical;
     if (data != 0 && length !=0){
         m_data.assign(data,length);
+        m_noData=false;
     }else{
         m_data=string();
         m_noData=true;

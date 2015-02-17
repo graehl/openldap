@@ -1,7 +1,7 @@
 /* $OpenLDAP$ */
 /* This work is part of OpenLDAP Software <http://www.openldap.org/>.
  *
- * Copyright 2000-2011 The OpenLDAP Foundation.
+ * Copyright 2000-2015 The OpenLDAP Foundation.
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -281,6 +281,7 @@ bdb_idl_cache_del_id(
 #define bdb_idl_next				BDB_SYMBOL(idl_next)
 #define bdb_idl_search				BDB_SYMBOL(idl_search)
 #define bdb_idl_insert				BDB_SYMBOL(idl_insert)
+#define bdb_idl_delete				BDB_SYMBOL(idl_delete)
 #define bdb_idl_intersection		BDB_SYMBOL(idl_intersection)
 #define bdb_idl_union				BDB_SYMBOL(idl_union)
 #define bdb_idl_sort				BDB_SYMBOL(idl_sort)
@@ -303,6 +304,7 @@ int bdb_idl_fetch_key(
 	int                     get_flag );
 
 int bdb_idl_insert( ID *ids, ID id );
+int bdb_idl_delete( ID *ids, ID id );
 
 int bdb_idl_insert_key(
 	BackendDB *be,
@@ -507,6 +509,7 @@ void bdb_unlocked_cache_return_entry_rw( struct bdb_info *bdb, Entry *e, int rw 
 #define bdb_cache_modrdn			BDB_SYMBOL(cache_modrdn)
 #define bdb_cache_release_all		BDB_SYMBOL(cache_release_all)
 #define bdb_cache_delete_entry		BDB_SYMBOL(cache_delete_entry)
+#define bdb_cache_deref				BDB_SYMBOL(cache_deref)
 
 int bdb_cache_children(
 	Operation *op,
@@ -574,6 +577,7 @@ void bdb_cache_delete_cleanup(
 	EntryInfo *ei
 );
 void bdb_cache_release_all( Cache *cache );
+void bdb_cache_deref( EntryInfo *ei );
 
 #ifdef BDB_HIER
 int hdb_cache_load(

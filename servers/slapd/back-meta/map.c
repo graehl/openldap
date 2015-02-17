@@ -2,7 +2,7 @@
 /* $OpenLDAP$ */
 /* This work is part of OpenLDAP Software <http://www.openldap.org/>.
  *
- * Copyright 1998-2011 The OpenLDAP Foundation.
+ * Copyright 1998-2015 The OpenLDAP Foundation.
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -60,9 +60,6 @@
 #include "lutil.h"
 #include "../back-ldap/back-ldap.h"
 #include "back-meta.h"
-
-#undef ldap_debug	/* silence a warning in ldap-int.h */
-#include "../../../libraries/libldap/ldap-int.h"
 
 int
 mapping_cmp ( const void *c1, const void *c2 )
@@ -301,7 +298,9 @@ map_attr_value(
 			return -1;
 		}
 
-	} else if ( ad->ad_type->sat_equality->smr_usage & SLAP_MR_MUTATION_NORMALIZER ) {
+	} else if ( ad->ad_type->sat_equality && 
+		ad->ad_type->sat_equality->smr_usage & SLAP_MR_MUTATION_NORMALIZER )
+	{
 		if ( ad->ad_type->sat_equality->smr_normalize(
 			(SLAP_MR_DENORMALIZE|SLAP_MR_VALUE_OF_ASSERTION_SYNTAX),
 			NULL, NULL, value, &vtmp, memctx ) )

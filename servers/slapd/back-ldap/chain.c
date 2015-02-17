@@ -2,7 +2,7 @@
 /* $OpenLDAP$ */
 /* This work is part of OpenLDAP Software <http://www.openldap.org/>.
  *
- * Copyright 2003-2011 The OpenLDAP Foundation.
+ * Copyright 2003-2015 The OpenLDAP Foundation.
  * Portions Copyright 2003 Howard Chu.
  * All rights reserved.
  *
@@ -118,7 +118,7 @@ static int ldap_chain_db_open_one( BackendDB *be );
 typedef struct ldap_chain_cb_t {
 	ldap_chain_status_t	lb_status;
 	ldap_chain_t		*lb_lc;
-	BI_op_func		*lb_op_f;
+	slap_operation_t	lb_op_type;
 	int			lb_depth;
 } ldap_chain_cb_t;
 
@@ -126,7 +126,7 @@ static int
 ldap_chain_op(
 	Operation	*op,
 	SlapReply	*rs,
-	BI_op_func	*op_f,
+	slap_operation_t op_type,
 	BerVarray	ref,
 	int		depth );
 
@@ -196,12 +196,13 @@ chaining_control_remove(
 	 * added by the chain overlay, so it's the only one we explicitly 
 	 * free */
 	if ( op->o_ctrls != oldctrls ) {
-		assert( op->o_ctrls != NULL );
-		assert( op->o_ctrls[ 0 ] != NULL );
+		if ( op->o_ctrls != NULL ) {
+			assert( op->o_ctrls[ 0 ] != NULL );
 
-		free( op->o_ctrls );
+			free( op->o_ctrls );
 
-		op->o_chaining = 0;
+			op->o_chaining = 0;
+		}
 		op->o_ctrls = oldctrls;
 	} 
 
@@ -225,7 +226,6 @@ ldap_chain_uri_cmp( const void *c1, const void *c2 )
 	assert( !BER_BVISNULL( &li2->li_bvuri[ 0 ] ) );
 	assert( BER_BVISNULL( &li2->li_bvuri[ 1 ] ) );
 
-	/* If local DNs don't match, it is definitely not a match */
 	return ber_bvcmp( &li1->li_bvuri[ 0 ], &li2->li_bvuri[ 0 ] );
 }
 
@@ -243,11 +243,10 @@ ldap_chain_uri_dup( void *c1, void *c2 )
 	assert( !BER_BVISNULL( &li2->li_bvuri[ 0 ] ) );
 	assert( BER_BVISNULL( &li2->li_bvuri[ 1 ] ) );
 
-	/* Cannot have more than one shared session with same DN */
 	if ( ber_bvcmp( &li1->li_bvuri[ 0 ], &li2->li_bvuri[ 0 ] ) == 0 ) {
 		return -1;
 	}
-		
+
 	return 0;
 }
 
@@ -317,11 +316,16 @@ ldap_chain_cb_search_response( Operation *op, SlapReply *rs )
 			&& lb->lb_depth < lb->lb_lc->lc_max_depth
 			&& rs->sr_ref != NULL )
 		{
-			rs->sr_err = ldap_chain_op( op, rs, lb->lb_op_f, rs->sr_ref, lb->lb_depth );
+			rs->sr_err = ldap_chain_op( op, rs, lb->lb_op_type,
+				rs->sr_ref, lb->lb_depth );
 		}
 
 		/* back-ldap tried to send result */
 		lb->lb_status = LDAP_CH_RES;
+		/* don't let other callbacks run, this isn't
+		 * the real result for this op.
+		 */
+		op->o_callback->sc_next = NULL;
 	}
 
 	return 0;
@@ -357,7 +361,8 @@ retry:;
 
 		case LDAP_REFERRAL:
 			if ( lb->lb_depth < lb->lb_lc->lc_max_depth && rs->sr_ref != NULL ) {
-				rs->sr_err = ldap_chain_op( op, rs, lb->lb_op_f, rs->sr_ref, lb->lb_depth );
+				rs->sr_err = ldap_chain_op( op, rs, lb->lb_op_type,
+					rs->sr_ref, lb->lb_depth );
 				goto retry;
 			}
 
@@ -392,7 +397,7 @@ static int
 ldap_chain_op(
 	Operation	*op,
 	SlapReply	*rs,
-	BI_op_func	*op_f,
+	slap_operation_t op_type,
 	BerVarray	ref,
 	int		depth )
 {
@@ -603,10 +608,10 @@ Document: RFC 4511
 				op->o_log_prefix, ref->bv_val, temporary ? "temporary" : "caching" );
 		}
 
-		lb->lb_op_f = op_f;
+		lb->lb_op_type = op_type;
 		lb->lb_depth = depth + 1;
 
-		rc = op_f( op, &rs2 );
+		rc = (&lback->bi_op_bind)[ op_type ]( op, &rs2 );
 
 		/* note the first error */
 		if ( first_rc == -1 ) {
@@ -625,6 +630,11 @@ cleanup:;
 		}
 
 further_cleanup:;
+		if ( op->o_req_dn.bv_val == pdn.bv_val ) {
+			op->o_req_dn = odn;
+			op->o_req_ndn = ondn;
+		}
+
 		if ( free_dn ) {
 			op->o_tmpfree( pdn.bv_val, op->o_tmpmemctx );
 			op->o_tmpfree( ndn.bv_val, op->o_tmpmemctx );
@@ -649,9 +659,6 @@ further_cleanup:;
 
 		rc = rs2.sr_err;
 	}
-
-	op->o_req_dn = odn;
-	op->o_req_ndn = ondn;
 
 #ifdef LDAP_CONTROL_X_CHAINING_BEHAVIOR
 	(void)chaining_control_remove( op, &ctrls );
@@ -874,7 +881,7 @@ ldap_chain_search(
 				op->o_log_prefix, ref->bv_val, temporary ? "temporary" : "caching" );
 		}
 
-		lb->lb_op_f = lback->bi_op_search;
+		lb->lb_op_type = op_search;
 		lb->lb_depth = depth + 1;
 
 		/* FIXME: should we also copy filter and scope?
@@ -896,13 +903,15 @@ cleanup:;
 		}
 		
 further_cleanup:;
+		if ( op->o_req_dn.bv_val == pdn.bv_val ) {
+			op->o_req_dn = odn;
+			op->o_req_ndn = ondn;
+		}
+
 		if ( free_dn ) {
 			op->o_tmpfree( pdn.bv_val, op->o_tmpmemctx );
 			op->o_tmpfree( ndn.bv_val, op->o_tmpmemctx );
 		}
-
-		op->o_req_dn = odn;
-		op->o_req_ndn = ondn;
 
 		if ( tmp_oq_search.rs_filter != NULL ) {
 			filter_free_x( op, tmp_oq_search.rs_filter, 1 );
@@ -926,8 +935,6 @@ further_cleanup:;
 	(void)chaining_control_remove( op, &ctrls );
 #endif /* LDAP_CONTROL_X_CHAINING_BEHAVIOR */
 
-	op->o_req_dn = odn;
-	op->o_req_ndn = ondn;
 	rs->sr_type = REP_SEARCHREF;
 	rs->sr_entry = save_entry;
 	rs->sr_flags = save_flags;
@@ -1042,30 +1049,30 @@ ldap_chain_response( Operation *op, SlapReply *rs )
 		/* FIXME: can we really get a referral for binds? */
 		op->o_req_ndn = slap_empty_bv;
 		op->o_conn = NULL;
-		rc = ldap_chain_op( op, rs, lback->bi_op_bind, ref, 0 );
+		rc = ldap_chain_op( op, rs, op_bind, ref, 0 );
 		op->o_req_ndn = rndn;
 		op->o_conn = conn;
 		}
 		break;
 
 	case LDAP_REQ_ADD:
-		rc = ldap_chain_op( op, rs, lback->bi_op_add, ref, 0 );
+		rc = ldap_chain_op( op, rs, op_add, ref, 0 );
 		break;
 
 	case LDAP_REQ_DELETE:
-		rc = ldap_chain_op( op, rs, lback->bi_op_delete, ref, 0 );
+		rc = ldap_chain_op( op, rs, op_delete, ref, 0 );
 		break;
 
 	case LDAP_REQ_MODRDN:
-		rc = ldap_chain_op( op, rs, lback->bi_op_modrdn, ref, 0 );
+		rc = ldap_chain_op( op, rs, op_modrdn, ref, 0 );
 	    	break;
 
 	case LDAP_REQ_MODIFY:
-		rc = ldap_chain_op( op, rs, lback->bi_op_modify, ref, 0 );
+		rc = ldap_chain_op( op, rs, op_modify, ref, 0 );
 		break;
 
 	case LDAP_REQ_COMPARE:
-		rc = ldap_chain_op( op, rs, lback->bi_op_compare, ref, 0 );
+		rc = ldap_chain_op( op, rs, op_compare, ref, 0 );
 		if ( rs->sr_err == LDAP_COMPARE_TRUE || rs->sr_err == LDAP_COMPARE_FALSE ) {
 			rc = LDAP_SUCCESS;
 		}
@@ -1082,8 +1089,7 @@ ldap_chain_response( Operation *op, SlapReply *rs )
 			 * to check limits, to make sure safe defaults
 			 * are in place */
 			if ( op->ors_limit != NULL || limits_check( op, rs ) == 0 ) {
-				rc = ldap_chain_op( op, rs, lback->bi_op_search, ref, 0 );
-
+				rc = ldap_chain_op( op, rs, op_search, ref, 0 );
 			} else {
 				rc = SLAP_CB_CONTINUE;
 			}
@@ -1091,7 +1097,7 @@ ldap_chain_response( Operation *op, SlapReply *rs )
 	    	break;
 
 	case LDAP_REQ_EXTENDED:
-		rc = ldap_chain_op( op, rs, lback->bi_extended, ref, 0 );
+		rc = ldap_chain_op( op, rs, op_extended, ref, 0 );
 		/* FIXME: ldap_back_extended() by design 
 		 * doesn't send result; frontend is expected
 		 * to send it... */
@@ -1223,6 +1229,9 @@ enum {
 static ConfigDriver chain_cf_gen;
 static ConfigCfAdd chain_cfadd;
 static ConfigLDAPadd chain_ldadd;
+#ifdef SLAP_CONFIG_DELETE
+static ConfigLDAPdel chain_lddel;
+#endif
 
 static ConfigTable chaincfg[] = {
 #ifdef LDAP_CONTROL_X_CHAINING_BEHAVIOR
@@ -1270,7 +1279,11 @@ static ConfigOCs chainocs[] = {
 		"NAME 'olcChainDatabase' "
 		"DESC 'Chain remote server configuration' "
 		"AUXILIARY )",
-		Cft_Misc, olcDatabaseDummy, chain_ldadd },
+		Cft_Misc, olcDatabaseDummy, chain_ldadd
+#ifdef SLAP_CONFIG_DELETE
+		, NULL, chain_lddel
+#endif
+	},
 	{ NULL, 0, NULL }
 };
 
@@ -1333,12 +1346,16 @@ chain_ldadd( CfEntryInfo *p, Entry *e, ConfigArgs *ca )
 
 	if ( lc->lc_common_li == NULL ) {
 		rc = ldap_chain_db_init_common( ca->be );
+		if ( rc != 0 )
+			goto fail;
+		li = ca->be->be_private;
+		lc->lc_common_li = lc->lc_cfg_li = li;
 
-	} else {
-		rc = ldap_chain_db_init_one( ca->be );
 	}
+	rc = ldap_chain_db_init_one( ca->be );
 
 	if ( rc != 0 ) {
+fail:
 		Debug( LDAP_DEBUG_ANY, "slapd-chain: "
 			"unable to init %sunderlying database \"%s\".\n",
 			lc->lc_common_li == NULL ? "common " : "", e->e_name.bv_val, 0 );
@@ -1347,10 +1364,7 @@ chain_ldadd( CfEntryInfo *p, Entry *e, ConfigArgs *ca )
 
 	li = ca->be->be_private;
 
-	if ( lc->lc_common_li == NULL ) {
-		lc->lc_common_li = li;
-
-	} else {
+	if ( at ) {
 		li->li_uri = ch_strdup( at->a_vals[ 0 ].bv_val );
 		value_add_one( &li->li_bvuri, &at->a_vals[ 0 ] );
 		if ( avl_insert( &lc->lc_lai.lai_tree, (caddr_t)li,
@@ -1433,6 +1447,45 @@ chain_cfadd( Operation *op, SlapReply *rs, Entry *p, ConfigArgs *ca )
 
 	return 0;
 }
+
+#ifdef SLAP_CONFIG_DELETE
+static int
+chain_lddel( CfEntryInfo *ce, Operation *op )
+{
+	CfEntryInfo	*pe = ce->ce_parent;
+	slap_overinst	*on = (slap_overinst *)pe->ce_bi;
+	ldap_chain_t	*lc = (ldap_chain_t *)on->on_bi.bi_private;
+	ldapinfo_t	*li = (ldapinfo_t *) ce->ce_be->be_private;
+
+	if ( li != lc->lc_common_li ) {
+		if (! avl_delete( &lc->lc_lai.lai_tree, li, ldap_chain_uri_cmp ) ) {
+			Debug( LDAP_DEBUG_ANY, "slapd-chain: avl_delete failed. "
+				"\"%s\" not found.\n", li->li_uri, 0, 0 );
+			return -1;
+		}
+	} else if ( lc->lc_lai.lai_tree ) {
+		Debug( LDAP_DEBUG_ANY, "slapd-chain: cannot delete first underlying "
+			"LDAP database when other databases are still present.\n", 0, 0, 0 );
+		return -1;
+	} else {
+		lc->lc_common_li = NULL;
+	}
+
+	ce->ce_be->bd_info = lback;
+
+	if ( ce->ce_be->bd_info->bi_db_close ) {
+		ce->ce_be->bd_info->bi_db_close( ce->ce_be, NULL );
+	}
+	if ( ce->ce_be->bd_info->bi_db_destroy ) {
+		ce->ce_be->bd_info->bi_db_destroy( ce->ce_be, NULL );
+	}
+
+	ch_free(ce->ce_be);
+	ce->ce_be = NULL;
+
+	return LDAP_SUCCESS;
+}
+#endif /* SLAP_CONFIG_DELETE */
 
 #ifdef LDAP_CONTROL_X_CHAINING_BEHAVIOR
 static slap_verbmasks chaining_mode[] = {
@@ -1721,20 +1774,17 @@ ldap_chain_db_config(
 	ldap_chain_t	*lc = (ldap_chain_t *)on->on_bi.bi_private;
 
 	int		rc = SLAP_CONF_UNKNOWN;
-		
+
 	if ( lc->lc_common_li == NULL ) {
-		void	*be_private = be->be_private;
-		ldap_chain_db_init_common( be );
-		lc->lc_common_li = lc->lc_cfg_li = (ldapinfo_t *)be->be_private;
-		be->be_private = be_private;
+		BackendDB db = *be;
+		ldap_chain_db_init_common( &db );
+		lc->lc_common_li = lc->lc_cfg_li = (ldapinfo_t *)db.be_private;
 	}
 
 	/* Something for the chain database? */
 	if ( strncasecmp( argv[ 0 ], "chain-", STRLENOF( "chain-" ) ) == 0 ) {
 		char		*save_argv0 = argv[ 0 ];
-		BackendInfo	*bd_info = be->bd_info;
-		void		*be_private = be->be_private;
-		ConfigOCs	*be_cf_ocs = be->be_cf_ocs;
+		BackendDB	db = *be;
 		static char	*allowed_argv[] = {
 			/* special: put URI here, so in the meanwhile
 			 * it detects whether a new URI is being provided */
@@ -1773,14 +1823,14 @@ ldap_chain_db_config(
 		}
 
 		if ( which_argv == 0 ) {
-			rc = ldap_chain_db_init_one( be );
+			rc = ldap_chain_db_init_one( &db );
 			if ( rc != 0 ) {
 				Debug( LDAP_DEBUG_ANY, "%s: line %d: "
 					"underlying slapd-ldap initialization failed.\n.",
 					fname, lineno, 0 );
 				return 1;
 			}
-			lc->lc_cfg_li = be->be_private;
+			lc->lc_cfg_li = db.be_private;
 		}
 
 		/* TODO: add checks on what other slapd-ldap(5) args
@@ -1790,27 +1840,21 @@ ldap_chain_db_config(
 		 * be warned.
 		 */
 
-		be->bd_info = lback;
-		be->be_private = (void *)lc->lc_cfg_li;
-		be->be_cf_ocs = lback->bi_cf_ocs;
+		db.bd_info = lback;
+		db.be_private = (void *)lc->lc_cfg_li;
+		db.be_cf_ocs = lback->bi_cf_ocs;
 
-		rc = config_generic_wrapper( be, fname, lineno, argc, argv );
+		rc = config_generic_wrapper( &db, fname, lineno, argc, argv );
 
 		argv[ 0 ] = save_argv0;
-		be->be_cf_ocs = be_cf_ocs;
-		be->be_private = be_private;
-		be->bd_info = bd_info;
 
 		if ( which_argv == 0 ) {
 private_destroy:;
 			if ( rc != 0 ) {
-				BackendDB		db = *be;
-
 				db.bd_info = lback;
 				db.be_private = (void *)lc->lc_cfg_li;
 				ldap_chain_db_destroy_one( &db, NULL );
 				lc->lc_cfg_li = NULL;
-
 			} else {
 				if ( lc->lc_cfg_li->li_bvuri == NULL
 					|| BER_BVISNULL( &lc->lc_cfg_li->li_bvuri[ 0 ] )
@@ -1836,7 +1880,7 @@ private_destroy:;
 			}
 		}
 	}
-	
+
 	return rc;
 }
 
@@ -2051,16 +2095,26 @@ ldap_chain_db_open_one(
 
 		if ( li->li_uri == NULL ) {
 			ber_str2bv( "cn=Common Connections", 0, 1,
-				&li->li_monitor_info.lmi_rdn );
+				&li->li_monitor_info.lmi_conn_rdn );
+			ber_str2bv( "cn=Operations on Common Connections", 0, 1,
+				&li->li_monitor_info.lmi_conn_rdn );
 
 		} else {
 			char		*ptr;
 
-			li->li_monitor_info.lmi_rdn.bv_len
+			li->li_monitor_info.lmi_conn_rdn.bv_len
 				= STRLENOF( "cn=" ) + strlen( li->li_uri );
-			ptr = li->li_monitor_info.lmi_rdn.bv_val
-				= ch_malloc( li->li_monitor_info.lmi_rdn.bv_len + 1 );
+			ptr = li->li_monitor_info.lmi_conn_rdn.bv_val
+				= ch_malloc( li->li_monitor_info.lmi_conn_rdn.bv_len + 1 );
 			ptr = lutil_strcopy( ptr, "cn=" );
+			ptr = lutil_strcopy( ptr, li->li_uri );
+			ptr[ 0 ] = '\0';
+
+			li->li_monitor_info.lmi_ops_rdn.bv_len
+				= STRLENOF( "cn=Operations on " ) + strlen( li->li_uri );
+			ptr = li->li_monitor_info.lmi_ops_rdn.bv_val
+				= ch_malloc( li->li_monitor_info.lmi_ops_rdn.bv_len + 1 );
+			ptr = lutil_strcopy( ptr, "cn=Operations on " );
 			ptr = lutil_strcopy( ptr, li->li_uri );
 			ptr[ 0 ] = '\0';
 		}

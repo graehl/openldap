@@ -2,7 +2,7 @@
 /* $OpenLDAP$ */
 /* This work is part of OpenLDAP Software <http://www.openldap.org/>.
  *
- * Copyright 1998-2011 The OpenLDAP Foundation.
+ * Copyright 1998-2015 The OpenLDAP Foundation.
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -105,11 +105,56 @@
 
 #include "lutil.h"
 #include "lutil_hash.h"
+
+#ifdef LUTIL_HASH64_BYTES
+#define HASH_BYTES				LUTIL_HASH64_BYTES
+#define HASH_LEN	hashlen
+static void (*hashinit)(lutil_HASH_CTX *ctx) = lutil_HASHInit;
+static void (*hashupdate)(lutil_HASH_CTX *ctx,unsigned char const *buf, ber_len_t len) = lutil_HASHUpdate;
+static void (*hashfinal)(unsigned char digest[HASH_BYTES], lutil_HASH_CTX *ctx) = lutil_HASHFinal;
+static int hashlen = LUTIL_HASH_BYTES;
+#define HASH_Init(c)			hashinit(c)
+#define HASH_Update(c,buf,len)	hashupdate(c,buf,len)
+#define HASH_Final(d,c)			hashfinal(d,c)
+
+/* Toggle between 32 and 64 bit hashing, default to 32 for compatibility
+   -1 to query, returns 1 if 64 bit, 0 if 32.
+   0/1 to set 32/64, returns 0 on success, -1 on failure */
+int slap_hash64( int onoff )
+{
+	if ( onoff < 0 ) {
+		return hashlen == LUTIL_HASH64_BYTES;
+	} else if ( onoff ) {
+		hashinit = lutil_HASH64Init;
+		hashupdate = lutil_HASH64Update;
+		hashfinal = lutil_HASH64Final;
+		hashlen = LUTIL_HASH64_BYTES;
+	} else {
+		hashinit = lutil_HASHInit;
+		hashupdate = lutil_HASHUpdate;
+		hashfinal = lutil_HASHFinal;
+		hashlen = LUTIL_HASH_BYTES;
+	}
+	return 0;
+}
+
+#else
 #define HASH_BYTES				LUTIL_HASH_BYTES
-#define HASH_CONTEXT			lutil_HASH_CTX
+#define HASH_LEN				HASH_BYTES
 #define HASH_Init(c)			lutil_HASHInit(c)
 #define HASH_Update(c,buf,len)	lutil_HASHUpdate(c,buf,len)
 #define HASH_Final(d,c)			lutil_HASHFinal(d,c)
+
+int slap_has64( int onoff )
+{
+	if ( onoff < 0 )
+		return 0;
+	else
+		return onoff ? -1 : 0;
+}
+
+#endif
+#define HASH_CONTEXT			lutil_HASH_CTX
 
 /* approx matching rules */
 #define directoryStringApproxMatchOID	"1.3.6.1.4.1.4203.666.4.4"
@@ -164,6 +209,7 @@ unsigned int index_intlen = SLAP_INDEX_INTLEN_DEFAULT;
 unsigned int index_intlen_strlen = SLAP_INDEX_INTLEN_STRLEN(
 	SLAP_INDEX_INTLEN_DEFAULT );
 
+ldap_pvt_thread_mutex_t	ad_index_mutex;
 ldap_pvt_thread_mutex_t	ad_undef_mutex;
 ldap_pvt_thread_mutex_t	oc_undef_mutex;
 
@@ -646,7 +692,7 @@ int octetStringIndexer(
 	unsigned char HASHdigest[HASH_BYTES];
 	struct berval digest;
 	digest.bv_val = (char *)HASHdigest;
-	digest.bv_len = sizeof(HASHdigest);
+	digest.bv_len = HASH_LEN;
 
 	for( i=0; !BER_BVISNULL( &values[i] ); i++ ) {
 		/* just count them */
@@ -692,7 +738,7 @@ int octetStringFilter(
 	struct berval *value = (struct berval *) assertedValue;
 	struct berval digest;
 	digest.bv_val = (char *)HASHdigest;
-	digest.bv_len = sizeof(HASHdigest);
+	digest.bv_len = HASH_LEN;
 
 	slen = syntax->ssyn_oidlen;
 	mlen = mr->smr_oidlen;
@@ -855,7 +901,7 @@ octetStringSubstringsIndexer(
 	unsigned char HASHdigest[HASH_BYTES];
 	struct berval digest;
 	digest.bv_val = (char *)HASHdigest;
-	digest.bv_len = sizeof(HASHdigest);
+	digest.bv_len = HASH_LEN;
 
 	nkeys = 0;
 
@@ -1020,7 +1066,7 @@ octetStringSubstringsFilter (
 	}
 
 	digest.bv_val = (char *)HASHdigest;
-	digest.bv_len = sizeof(HASHdigest);
+	digest.bv_len = HASH_LEN;
 
 	slen = syntax->ssyn_oidlen;
 	mlen = mr->smr_oidlen;
@@ -1734,16 +1780,15 @@ UTF8StringValidate(
 	Syntax *syntax,
 	struct berval *in )
 {
-	ber_len_t count;
 	int len;
-	unsigned char *u = (unsigned char *)in->bv_val;
+	unsigned char *u = (unsigned char *)in->bv_val, *end = in->bv_val + in->bv_len;
 
 	if( BER_BVISEMPTY( in ) && syntax == slap_schema.si_syn_directoryString ) {
 		/* directory strings cannot be empty */
 		return LDAP_INVALID_SYNTAX;
 	}
 
-	for( count = in->bv_len; count > 0; count -= len, u += len ) {
+	for( ; u < end; u += len ) {
 		/* get the length indicated by the first byte */
 		len = LDAP_UTF8_CHARLEN2( u, len );
 
@@ -1781,7 +1826,7 @@ UTF8StringValidate(
 		if( LDAP_UTF8_OFFSET( (char *)u ) != len ) return LDAP_INVALID_SYNTAX;
 	}
 
-	if( count != 0 ) {
+	if( u > end ) {
 		return LDAP_INVALID_SYNTAX;
 	}
 
@@ -1852,12 +1897,12 @@ UTF8StringNormalize(
 		}
 		nvalue.bv_val[nvalue.bv_len] = '\0';
 
-	} else {
+	} else if ( tmp.bv_len )  {
 		/* string of all spaces is treated as one space */
 		nvalue.bv_val[0] = ' ';
 		nvalue.bv_val[1] = '\0';
 		nvalue.bv_len = 1;
-	}
+	}	/* should never be entered with 0-length val */
 
 	*normalized = nvalue;
 	return LDAP_SUCCESS;
@@ -2154,7 +2199,11 @@ approxIndexer(
 			len = strlen( c );
 			if( len < SLAPD_APPROX_WORDLEN ) continue;
 			ber_str2bv( phonetic( c ), 0, 0, &keys[keycount] );
-			keycount++;
+			if( keys[keycount].bv_len ) {
+				keycount++;
+			} else {
+				ch_free( keys[keycount].bv_val );
+			}
 			i++;
 		}
 
@@ -2331,13 +2380,18 @@ postalAddressNormalize(
 	}
 	lines[l].bv_len = &val->bv_val[c] - lines[l].bv_val;
 
-	normalized->bv_len = l;
+	normalized->bv_len = c = l;
 
-	for ( l = 0; !BER_BVISNULL( &lines[l] ); l++ ) {
+	for ( l = 0; l <= c; l++ ) {
 		/* NOTE: we directly normalize each line,
 		 * without unescaping the values, since the special
 		 * values '\24' ('$') and '\5C' ('\') are not affected
 		 * by normalization */
+		if ( !lines[l].bv_len ) {
+			nlines[l].bv_len = 0;
+			nlines[l].bv_val = NULL;
+			continue;
+		}
 		rc = UTF8StringNormalize( usage, NULL, xmr, &lines[l], &nlines[l], ctx );
 		if ( rc != LDAP_SUCCESS ) {
 			rc = LDAP_INVALID_SYNTAX;
@@ -2350,7 +2404,7 @@ postalAddressNormalize(
 	normalized->bv_val = slap_sl_malloc( normalized->bv_len + 1, ctx );
 
 	p = normalized->bv_val;
-	for ( l = 0; !BER_BVISNULL( &nlines[l] ); l++ ) {
+	for ( l = 0; l <= c ; l++ ) {
 		p = lutil_strbvcopy( p, &nlines[l] );
 		*p++ = '$';
 	}
@@ -2626,8 +2680,10 @@ integerIndexer(
 				itmp.bv_len = maxstrlen;
 		}
 		rc = integerVal2Key( &values[i], &keys[i], &itmp, ctx );
-		if ( rc )
+		if ( rc ) {
+			slap_sl_free( keys, ctx );
 			goto func_leave;
+		}
 	}
 	*keysp = keys;
 func_leave:
@@ -2674,12 +2730,16 @@ integerFilter(
 	}
 
 	rc = integerVal2Key( value, keys, &iv, ctx );
-	if ( rc == 0 )
-		*keysp = keys;
 
 	if ( iv.bv_val != ibuf ) {
 		slap_sl_free( iv.bv_val, ctx );
 	}
+
+	if ( rc == 0 )
+		*keysp = keys;
+	else
+		slap_sl_free( keys, ctx );
+
 	return rc;
 }
 
@@ -3255,6 +3315,7 @@ serialNumberAndIssuerCheck(
 					}
 					if ( is->bv_val[is->bv_len+1] == '"' ) {
 						/* double dquote */
+						numdquotes++;
 						is->bv_len += 2;
 						continue;
 					}
@@ -3556,14 +3617,9 @@ serialNumberAndIssuerNormalize(
 		sn2.bv_val = slap_sl_malloc( sn.bv_len, ctx );
 	}
 	sn2.bv_len = sn.bv_len;
-	if ( lutil_str2bin( &sn, &sn2, ctx )) {
-		rc = LDAP_INVALID_SYNTAX;
-		goto func_leave;
-	}
-
 	sn3.bv_val = sbuf3;
 	sn3.bv_len = sizeof(sbuf3);
-	if ( slap_bin2hex( &sn2, &sn3, ctx ) ) {
+	if ( lutil_str2bin( &sn, &sn2, ctx ) || slap_bin2hex( &sn2, &sn3, ctx ) ) {
 		rc = LDAP_INVALID_SYNTAX;
 		goto func_leave;
 	}
@@ -3571,7 +3627,6 @@ serialNumberAndIssuerNormalize(
 	out->bv_len = STRLENOF( "{ serialNumber , issuer rdnSequence:\"\" }" )
 		+ sn3.bv_len + ni.bv_len;
 	out->bv_val = slap_sl_malloc( out->bv_len + 1, ctx );
-
 	if ( out->bv_val == NULL ) {
 		out->bv_len = 0;
 		rc = LDAP_OTHER;
@@ -3664,12 +3719,14 @@ certificateExactNormalize(
 	tag = ber_skip_tag( ber, &len );	/* SignatureAlg */
 	ber_skip_data( ber, len );
 	tag = ber_peek_tag( ber, &len );	/* IssuerDN */
-	len = ber_ptrlen( ber );
-	bvdn.bv_val = val->bv_val + len;
-	bvdn.bv_len = val->bv_len - len;
+	if ( len ) {
+		len = ber_ptrlen( ber );
+		bvdn.bv_val = val->bv_val + len;
+		bvdn.bv_len = val->bv_len - len;
 
-	rc = dnX509normalize( &bvdn, &issuer_dn );
-	if ( rc != LDAP_SUCCESS ) goto done;
+		rc = dnX509normalize( &bvdn, &issuer_dn );
+		if ( rc != LDAP_SUCCESS ) goto done;
+	}
 
 	normalized->bv_len = STRLENOF( "{ serialNumber , issuer rdnSequence:\"\" }" )
 		+ sn2.bv_len + issuer_dn.bv_len;
@@ -3836,6 +3893,7 @@ issuerAndThisUpdateCheck(
 				}
 				if ( is->bv_val[is->bv_len+1] == '"' ) {
 					/* double dquote */
+					numdquotes++;
 					is->bv_len += 2;
 					continue;
 				}
@@ -4378,6 +4436,7 @@ serialNumberAndIssuerSerialCheck(
 						}
 						if ( is->bv_val[is->bv_len + 1] == '"' ) {
 							/* double dquote */
+							numdquotes++;
 							is->bv_len += 2;
 							continue;
 						}
@@ -4769,13 +4828,13 @@ attributeCertificateExactNormalize(
 	ber_tag_t tag;
 	ber_len_t len;
 	char issuer_serialbuf[SLAP_SN_BUFLEN], serialbuf[SLAP_SN_BUFLEN];
-	struct berval sn, i_sn, sn2, i_sn2;
+	struct berval sn, i_sn, sn2 = BER_BVNULL, i_sn2 = BER_BVNULL;
 	struct berval issuer_dn = BER_BVNULL, bvdn;
 	char *p;
 	int rc = LDAP_INVALID_SYNTAX;
 
 	if ( BER_BVISEMPTY( val ) ) {
-		goto done;
+		return rc;
 	}
 
 	if ( SLAP_MR_IS_VALUE_OF_ASSERTION_SYNTAX(usage) ) {
@@ -4799,8 +4858,7 @@ attributeCertificateExactNormalize(
 	tag = ber_skip_tag( ber, &len );	/* GeneralNames (sequence) */
 	tag = ber_skip_tag( ber, &len );	/* directoryName (we only accept this form of GeneralName) */
 	if ( tag != SLAP_X509_GN_DIRECTORYNAME ) { 
-		rc = LDAP_INVALID_SYNTAX; 
-		goto done;
+		return LDAP_INVALID_SYNTAX; 
 	}
 	tag = ber_peek_tag( ber, &len );	/* sequence of RDN */
 	len = ber_ptrlen( ber );
@@ -6336,7 +6394,9 @@ char *componentFilterMatchSyntaxes[] = {
 #endif
 
 char *directoryStringSyntaxes[] = {
+	"1.3.6.1.4.1.1466.115.121.1.11" /* countryString */,
 	"1.3.6.1.4.1.1466.115.121.1.44" /* printableString */,
+	"1.3.6.1.4.1.1466.115.121.1.50" /* telephoneNumber */,
 	NULL
 };
 char *integerFirstComponentMatchSyntaxes[] = {
@@ -6771,7 +6831,7 @@ static slap_mrule_defs_rec mrule_defs[] = {
 
 	{"( 1.3.6.1.4.1.4203.666.11.2.3 NAME 'CSNOrderingMatch' "
 		"SYNTAX 1.3.6.1.4.1.4203.666.11.2.1 )",
-		SLAP_MR_HIDE | SLAP_MR_ORDERING | SLAP_MR_ORDERED_INDEX, NULL,
+		SLAP_MR_HIDE | SLAP_MR_ORDERING | SLAP_MR_EXT | SLAP_MR_ORDERED_INDEX, NULL,
 		NULL, csnNormalize, csnOrderingMatch,
 		NULL, NULL,
 		"CSNMatch" },
@@ -6851,6 +6911,7 @@ schema_destroy( void )
 	syn_destroy();
 
 	if( schema_init_done ) {
+		ldap_pvt_thread_mutex_destroy( &ad_index_mutex );
 		ldap_pvt_thread_mutex_destroy( &ad_undef_mutex );
 		ldap_pvt_thread_mutex_destroy( &oc_undef_mutex );
 	}

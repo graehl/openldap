@@ -2,7 +2,7 @@
 /* $OpenLDAP$ */
 /* This work is part of OpenLDAP Software <http://www.openldap.org/>.
  *
- * Copyright 1998-2011 The OpenLDAP Foundation.
+ * Copyright 1998-2015 The OpenLDAP Foundation.
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -100,12 +100,21 @@ typedef int (ConfigLDAPadd)(
 typedef int (ConfigCfAdd)(
 	Operation *op, SlapReply *rs, Entry *parent, struct config_args_s *ca );
 
+#ifdef SLAP_CONFIG_DELETE
+/* Called when deleting a Cft_Misc Child object from cn=config */
+typedef int (ConfigLDAPdel)(
+	CfEntryInfo *ce, Operation *op );
+#endif
+
 typedef struct ConfigOCs {
 	const char *co_def;
 	ConfigType co_type;
 	ConfigTable *co_table;
 	ConfigLDAPadd *co_ldadd;
 	ConfigCfAdd *co_cfadd;
+#ifdef SLAP_CONFIG_DELETE
+	ConfigLDAPdel *co_lddel;
+#endif
 	ObjectClass *co_oc;
 	struct berval *co_name;
 } ConfigOCs;
@@ -135,7 +144,7 @@ typedef struct config_args_s {
 		int v_int;
 		unsigned v_uint;
 		long v_long;
-		unsigned long v_ulong;
+		size_t v_ulong;
 		ber_len_t v_ber_t;
 		char *v_string;
 		struct berval v_bv;

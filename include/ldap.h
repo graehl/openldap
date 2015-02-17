@@ -1,7 +1,7 @@
 /* $OpenLDAP$ */
 /* This work is part of OpenLDAP Software <http://www.openldap.org/>.
  * 
- * Copyright 1998-2011 The OpenLDAP Foundation.
+ * Copyright 1998-2015 The OpenLDAP Foundation.
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -157,6 +157,11 @@ LDAP_BEGIN_DECL
 #define LDAP_OPT_X_TLS_DHFILE		0x600e
 #define LDAP_OPT_X_TLS_NEWCTX		0x600f
 #define LDAP_OPT_X_TLS_CRLFILE		0x6010	/* GNUtls only */
+#define LDAP_OPT_X_TLS_PACKAGE		0x6011
+#define LDAP_OPT_X_TLS_ECNAME		0x6012
+#define LDAP_OPT_X_TLS_VERSION		0x6013	/* read-only */
+#define LDAP_OPT_X_TLS_CIPHER		0x6014	/* read-only */
+#define LDAP_OPT_X_TLS_PEERCERT		0x6015	/* read-only */
 
 #define LDAP_OPT_X_TLS_NEVER	0
 #define LDAP_OPT_X_TLS_HARD		1
@@ -298,6 +303,8 @@ typedef struct ldapcontrol {
 #define LDAP_SYNC_DELETE				3
 #define LDAP_SYNC_NEW_COOKIE			4
 
+/* LDAP Don't Use Copy Control (RFC 6171) */
+#define LDAP_CONTROL_DONTUSECOPY		"1.3.6.1.1.22"
 
 /* Password policy Controls *//* work in progress */
 /* ITS#3458: released; disabled by default */
@@ -311,7 +318,6 @@ typedef struct ldapcontrol {
 #define LDAP_CONTROL_MANAGEDIT			LDAP_CONTROL_RELAX
 #define LDAP_CONTROL_SLURP				"1.3.6.1.4.1.4203.666.5.13"
 #define LDAP_CONTROL_VALSORT			"1.3.6.1.4.1.4203.666.5.14"
-#define LDAP_CONTROL_DONTUSECOPY		"1.3.6.1.4.1.4203.666.5.15"
 #define	LDAP_CONTROL_X_DEREF			"1.3.6.1.4.1.4203.666.5.16"
 #define	LDAP_CONTROL_X_WHATFAILED		"1.3.6.1.4.1.4203.666.5.17"
 
@@ -326,6 +332,7 @@ typedef struct ldapcontrol {
 #define LDAP_REFERRALS_REQUIRED				3
 
 /* MS Active Directory controls (for compatibility) */
+#define LDAP_CONTROL_X_LAZY_COMMIT			"1.2.840.113556.1.4.619"
 #define LDAP_CONTROL_X_INCREMENTAL_VALUES	"1.2.840.113556.1.4.802"
 #define LDAP_CONTROL_X_DOMAIN_SCOPE			"1.2.840.113556.1.4.1339"
 #define LDAP_CONTROL_X_PERMISSIVE_MODIFY	"1.2.840.113556.1.4.1413"
@@ -337,7 +344,6 @@ typedef struct ldapcontrol {
 /* MS Active Directory controls - not implemented in slapd(8) */
 #define LDAP_CONTROL_X_EXTENDED_DN		"1.2.840.113556.1.4.529"
 
-#ifdef LDAP_DEVEL
 /* <draft-wahl-ldap-session> */
 #define LDAP_CONTROL_X_SESSION_TRACKING		"1.3.6.1.4.1.21008.108.63.1"
 #define LDAP_CONTROL_X_SESSION_TRACKING_RADIUS_ACCT_SESSION_ID \
@@ -346,9 +352,8 @@ typedef struct ldapcontrol {
 						LDAP_CONTROL_X_SESSION_TRACKING ".2"
 #define LDAP_CONTROL_X_SESSION_TRACKING_USERNAME \
 						LDAP_CONTROL_X_SESSION_TRACKING ".3"
-#endif /* LDAP_DEVEL */
-
 /* various expired works */
+
 /* LDAP Duplicated Entry Control Extension *//* not implemented in slapd(8) */
 #define LDAP_CONTROL_DUPENT_REQUEST		"2.16.840.1.113719.1.27.101.1"
 #define LDAP_CONTROL_DUPENT_RESPONSE	"2.16.840.1.113719.1.27.101.2"
@@ -386,7 +391,7 @@ typedef struct ldapcontrol {
 #define	LDAP_EXOP_REFRESH		"1.3.6.1.4.1.1466.101.119.1"	/* RFC 2589 */
 #define	LDAP_TAG_EXOP_REFRESH_REQ_DN	((ber_tag_t) 0x80U)
 #define	LDAP_TAG_EXOP_REFRESH_REQ_TTL	((ber_tag_t) 0x81U)
-#define	LDAP_TAG_EXOP_REFRESH_RES_TTL	((ber_tag_t) 0x80U)
+#define	LDAP_TAG_EXOP_REFRESH_RES_TTL	((ber_tag_t) 0x81U)
 
 #define LDAP_EXOP_VERIFY_CREDENTIALS	"1.3.6.1.4.1.4203.666.6.5"
 #define LDAP_EXOP_X_VERIFY_CREDENTIALS	LDAP_EXOP_VERIFY_CREDENTIALS
@@ -418,13 +423,17 @@ typedef struct ldapcontrol {
 #define LDAP_URLEXT_X_SEARCHEDSUBTREE	"x-searchedSubtree"
 #define LDAP_URLEXT_X_FAILEDNAME	"x-failedName"
 
-#ifdef LDAP_DEVEL
-#define LDAP_X_TXN						"1.3.6.1.4.1.4203.666.11.7" /* tmp */
-#define LDAP_EXOP_X_TXN_START			LDAP_X_TXN ".1"
-#define LDAP_CONTROL_X_TXN_SPEC			LDAP_X_TXN ".2"
-#define LDAP_EXOP_X_TXN_END				LDAP_X_TXN ".3"
-#define LDAP_EXOP_X_TXN_ABORTED_NOTICE	LDAP_X_TXN ".4"
-#endif
+#define LDAP_TXN						"1.3.6.1.1.21" /* RFC 5805 */
+#define LDAP_EXOP_TXN_START				LDAP_X_TXN ".1"
+#define LDAP_CONTROL_TXN_SPEC			LDAP_X_TXN ".2"
+#define LDAP_EXOP_TXN_END				LDAP_X_TXN ".3"
+#define LDAP_EXOP_TXN_ABORTED_NOTICE	LDAP_X_TXN ".4"
+
+#define	LDAP_X_TXN	LDAP_TXN
+#define LDAP_EXOP_X_TXN_START			LDAP_EXOP_TXN_START
+#define LDAP_CONTROL_X_TXN_SPEC			LDAP_CONTROL_TXN_SPEC
+#define LDAP_EXOP_X_TXN_END				LDAP_EXOP_TXN_END
+#define LDAP_EXOP_X_TXN_ABORTED_NOTICE	LDAP_EXOP_TXN_ABORTED_NOTICE
 
 /* LDAP Features */
 #define LDAP_FEATURE_ALL_OP_ATTRS	"1.3.6.1.4.1.4203.1.5.1"	/* RFC 3673 */
@@ -2512,7 +2521,7 @@ ldap_create_session_tracking_value LDAP_P((
 	struct berval	*value ));
 
 LDAP_F( int )
-ldap_create_session_tracking LDAP_P((
+ldap_create_session_tracking_control LDAP_P((
 	LDAP		*ld,
 	char		*sessionSourceIp,
 	char		*sessionSourceName,
@@ -2663,7 +2672,7 @@ ldap_ldif_record_done LDAP_P((
 LDAP_F( int )
 ldap_parse_ldif_record LDAP_P((
 	struct berval *rbuf,
-	int linenum,
+	unsigned long linenum,
 	LDIFRecord *lr,
 	const char *errstr,
 	unsigned int flags ));
